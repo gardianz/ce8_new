@@ -1,24 +1,49 @@
 {
-    "app_base": "https://app.templedigitalgroup.com",
-    "cantonloop_base": "https://cantonloop.com",
-    "symbol": "Amulet/USDCx",
-    "strategy": "auto",
-    "auto_deposit": true,
-    "max_cc_deposit": 200,
-    "auto": {
-        "auto_quantity": 105,
-        "auto_poll_interval": 4,
-        "auto_max_open": 500,
-        "auto_use_oracle": true,
-        "strategy_key": "G",
-        "order_max_age": 3600,
-        "min_cc_reserve": 0
+    "_petunjuk": "Pengaturan bot — edit nilai sesuai kebutuhan, jangan ubah nama field.",
+
+    "jumlah_swap": 10000,
+    "_jumlah_swap": "Berapa kali putaran swap (1 putaran = CC -> USDCx -> CETH -> CC).",
+
+    "jeda_antar_swap_detik": {
+        "minimal": 10,
+        "maksimal": 11,
+        "_keterangan": "Jeda acak antar putaran swap (detik). Bot akan tidur antara 'minimal'-'maksimal' detik."
     },
-    "loop": {
-        "loop_cc_reserve": 25.0,
-        "loop_usdc_reserve": 0.1,
-        "loop_poll_interval": 10,
-        "max_settling_for_deposit": 0
+
+    "jeda_start_antar_akun_detik": {
+        "minimal": 5,
+        "maksimal": 10,
+        "_keterangan": "Jeda acak saat memulai tiap akun supaya tidak start berbarengan."
     },
-    "cantonloop_party_id": "LOOP PARTY ID"
+
+    "swap_minimum_cc": {
+        "tambahan_cc": 1.5,
+        "fallback_jika_api_gagal": 27,
+        "_keterangan": "Bot mengambil minimum swap dari API lalu menambah 'tambahan_cc'. Jika API gagal, pakai 'fallback_jika_api_gagal'."
+    },
+
+    "menunggu_saldo_cc_dibawah": 27,
+    "_menunggu_saldo_cc_dibawah": "Kalau setelah bulk-back CC <= angka ini, bot akan menunggu saldo masuk.",
+
+    "berhenti_jika_reward_cc_tercapai": 10000,
+    "_berhenti_jika_reward_cc_tercapai": "Hentikan swap kalau saldo CC sudah >= angka ini (anggap reward sudah turun).",
+
+    "rate_limit": {
+        "tunggu_pertama_menit": 15,
+        "tunggu_lanjutan_detik": [15, 30, 60],
+        "_keterangan": "Saat kena rate limit (429): hit pertama tunggu N menit, hit berikutnya tunggu sesuai 'tunggu_lanjutan_detik' (detik)."
+    },
+
+    "tampilan": {
+        "max_log_baris": 35,
+        "_keterangan": "Jumlah baris log yang ditampilkan di panel kanan."
+    },
+
+    "telegram": {
+        "aktif": true,
+        "bot_token": "",
+        "chat_id": "",
+        "interval_menit": 60,
+        "_keterangan": "Notifikasi summary (TOT) ke Telegram. Set 'aktif': false untuk mematikan. 'interval_menit' = jeda antar notifikasi dalam menit."
+    }
 }
