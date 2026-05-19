@@ -1,7 +1,7 @@
 /**
  * ╔══════════════════════════════════════════════════════╗
- * ║        CANTOR8 MULTI-ACCOUNT WALLET BOT V2        ║
- * ║    Auto CC  USDCX Round-Trip Swap (Parallel)       ║
+ * ║       🤖 CANTOR8 MULTI-ACCOUNT WALLET BOT V2.1       ║
+ * ║    Auto CC ↔ USDCX Round-Trip Swap (Parallel)        ║
  * ╚══════════════════════════════════════════════════════╝
  *
  * Usage: node index.js
@@ -9,7 +9,6 @@
  */
 
 import { readFileSync, writeFileSync, appendFileSync } from 'fs';
-import { createInterface } from 'readline';
 import { randomBytes } from 'crypto';
 import http from 'http';
 import https from 'https';
@@ -25,7 +24,8 @@ import { HttpProxyAgent } from 'http-proxy-agent';
 // ── Setup ────────────────────────────────────────────────────────────────
 ed.etc.sha512Sync = (...m) => sha512(ed.etc.concatBytes(...m));
 
-const config = JSON.parse(readFileSync(new URL('./config.json', import.meta.url), 'utf-8'));
+// ── Load user-facing config (terminologi ramah user) ───────────────────
+const userCfg = JSON.parse(readFileSync(new URL('./config.json', import.meta.url), 'utf-8'));
 
 // Load accounts from accounts.json (one mnemonic per line) + proxy.txt (one proxy per line)
 const accountLines = readFileSync(new URL('./accounts.json', import.meta.url), 'utf-8')
@@ -35,6 +35,56 @@ try {
     proxyLines = readFileSync(new URL('./proxy.txt', import.meta.url), 'utf-8')
         .split('\n').map(l => l.trim()).filter(l => l.length > 0);
 } catch { /* proxy.txt optional */ }
+
+// ── Internal config: hardcoded technical settings + map dari user config ──
+const config = {
+    swap: {
+        enabled: true,
+        rounds: userCfg.jumlah_swap ?? 1000,
+        delay_min_seconds: userCfg.jeda_antar_swap_detik?.minimal ?? 10,
+        delay_max_seconds: userCfg.jeda_antar_swap_detik?.maksimal ?? 20,
+        min_amount: userCfg.swap_minimum_cc?.fallback_jika_api_gagal ?? 27,
+        cc_reserve: 0.1,
+        waiting_balance_threshold: userCfg.menunggu_saldo_cc_dibawah ?? 27,
+        reward_landed_threshold: userCfg.berhenti_jika_reward_cc_tercapai ?? 100,
+        dynamic_minimum_swap: {
+            enabled: true,
+            extra_cc: userCfg.swap_minimum_cc?.tambahan_cc ?? 1.5,
+            fallback_min: userCfg.swap_minimum_cc?.fallback_jika_api_gagal ?? 27,
+        },
+        pair_a: { chain: 'CC', asset: '0x0', label: 'CC (Amulet)' },
+        pair_b: { chain: 'CC', asset: 'USDCX', label: 'USDCX' },
+        pair_c: { chain: 'CC', asset: 'CETH', label: 'CETH' },
+    },
+    background_refresh: {
+        enabled: true,
+        interval_seconds: 600,
+    },
+    retry: {
+        rate_limit_initial_delay_minutes: userCfg.rate_limit?.tunggu_pertama_menit ?? 50,
+        rate_limit_delays: userCfg.rate_limit?.tunggu_lanjutan_detik ?? [15, 30, 60],
+        server_rejected_delays: [15, 30, 60],
+    },
+    api: {
+        backend_url: 'https://wallet-backend.main.digik.cantor8.tech/api',
+        swap_url: 'https://api.vectornine.tech',
+        exchange_url: 'https://exchange.cantor8.tech',
+    },
+    stagger_min_seconds: userCfg.jeda_start_antar_akun_detik?.minimal ?? 5,
+    stagger_max_seconds: userCfg.jeda_start_antar_akun_detik?.maksimal ?? 60,
+    derivation: {
+        path_prefix: "m/501'/800245900'/0'",
+        path_suffix: "0'",
+        key_count: 20,
+    },
+    max_log_lines: userCfg.tampilan?.max_log_baris ?? 50,
+    telegram: {
+        enabled: userCfg.telegram?.aktif === true,
+        bot_token: userCfg.telegram?.bot_token || '',
+        chat_id: userCfg.telegram?.chat_id || '',
+        interval_minutes: userCfg.telegram?.interval_menit ?? 60,
+    },
+};
 
 config.accounts = accountLines.map((mnemonic, i) => ({
     name: `Acc ${i + 1}`,
@@ -47,39 +97,6 @@ const SWAP_API = config.api.swap_url;
 const EXCHANGE = config.api.exchange_url;
 
 const ASSET_TO_INSTRUMENT = { '0x0': 'Amulet', 'USDCX': 'USDCx', 'CETH': 'cETH' };
-const CETH_INST_ADMIN = 'rails-cethMain-1::12200350ba6e96e3b701c3048b5aa013a8c1c08833e8ebf54339cff581055c29003a';
-
-// ── Active Pair Mode (set at startup) ────────────────────────────────────
-let activePairMode = 'USDCX'; // 'USDCX' or 'CETH'
-let swapMode = 4; // 1=CCUSDCx, 2=CCCETH, 3=Triangular, 4=Extended
-
-const CC_ASSET_KEYS = ['Amulet', 'CC (Amulet)', 'CC'];
-const USDCX_ASSET_KEYS = ['USDCx', 'USDCX'];
-const CETH_ASSET_KEYS = ['cETH', 'CETH'];
-
-function getPairBAssetKeys() {
-    return activePairMode === 'CETH' ? CETH_ASSET_KEYS : USDCX_ASSET_KEYS;
-}
-function getPairBLabel() {
-    return activePairMode === 'CETH' ? 'CETH' : 'USDCx';
-}
-function getBulkMin() {
-    return activePairMode === 'CETH' ? (config.swap.ceth_bulk_min ?? 0.0005) : 1;
-}
-function getPairBDecimals() {
-    return activePairMode === 'CETH' ? 8 : 4;
-}
-function getHoldingBal(holdings, keys) {
-    for (const k of keys) {
-        if (holdings?.[k]?.balance != null) return holdings[k].balance;
-    }
-    return 0;
-}
-function getActivePairB() {
-    return activePairMode === 'CETH'
-        ? (config.swap.pair_ceth || { chain: 'CC', asset: 'CETH', label: 'CETH' })
-        : config.swap.pair_b;
-}
 
 // ── Dynamic Minimum Swap Config (SIMPLE) ─────────────────────────────────
 const dynamicMinSwap = {
@@ -89,7 +106,8 @@ const dynamicMinSwap = {
     lastRawMin: null,  // cache untuk bulk-back check
 };
 
-const BASE_HEADERS = {
+// Headers untuk wallet-backend (cantor8 wallet) — domain wallet.cantor8.tech
+const WALLET_HEADERS = {
     'Accept': 'application/json',
     'Content-Type': 'application/json',
     'Origin': 'https://wallet.cantor8.tech',
@@ -97,8 +115,20 @@ const BASE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
 };
 
+// Headers untuk swap API (api.vectornine.tech) — domain exchange.cantor8.tech
+const SWAP_HEADERS = {
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
+    'Origin': 'https://exchange.cantor8.tech',
+    'Referer': 'https://exchange.cantor8.tech/',
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+};
+
+// Backwards-compat alias (untuk kode lain yang masih merujuk BASE_HEADERS)
+const BASE_HEADERS = WALLET_HEADERS;
+
 const TOKEN_MAX_AGE_MS = 45 * 60 * 1000;
-const SETUP_WAIT_MAX = 30;   // max retries waiting for account setup (422) — ~15 min at 30s intervals
+const SETUP_WAIT_MAX = Infinity;   // max retries waiting for account setup (422)
 const SETUP_WAIT_SEC = 10;   // seconds between setup retries
 
 // ── Crypto ───────────────────────────────────────────────────────────────
@@ -143,247 +173,6 @@ function generateOrderId() {
 const sleep = (sec) => new Promise(r => setTimeout(r, sec * 1000));
 const shortId = (id) => id.length > 20 ? `${id.slice(0, 12)}...${id.slice(-8)}` : id;
 
-// ── Telegram Notifications ───────────────────────────────────────────────
-async function sendTelegramMessage(text) {
-    const tcfg = config.telegram;
-    if (!tcfg?.enabled || !tcfg?.bot_token || !tcfg?.user_id) return;
-    try {
-        const url = `https://api.telegram.org/bot${tcfg.bot_token}/sendMessage`;
-        await axios.post(url, {
-            chat_id: tcfg.user_id,
-            text: text,
-            parse_mode: 'HTML',
-            disable_web_page_preview: true
-        });
-    } catch (err) { }
-}
-
-async function sendSwapNotification(ctx, type, sendAmount, result) {
-    if (!config.telegram?.enabled) return;
-    const { index } = ctx;
-    const a = dashboard.accounts[index];
-    if (!a) return;
-
-    const pairLabel = getPairBLabel();
-    const pairDec = getPairBDecimals();
-    const isMain = type === 'MAIN';
-    const fromSymbol = isMain ? 'CC' : pairLabel;
-    const toSymbol = isMain ? pairLabel : 'CC';
-    const nextText = isMain ? `${pairLabel} → CC` : `CC → ${pairLabel}`;
-
-    const receiveAmount = typeof result === 'object' ? result?.receiveAmount : result;
-    const swapData = typeof result === 'object' ? result : {};
-
-    const formatUptimeLocal = (startMs) => {
-        const sec = Math.floor((Date.now() - startMs) / 1000);
-        const h = Math.floor(sec / 3600);
-        const m = Math.floor((sec % 3600) / 60);
-        const s = sec % 60;
-        if (h > 0) return `${h}h${String(m).padStart(2, '0')}m${String(s).padStart(2, '0')}s`;
-        return `${m}m${String(s).padStart(2, '0')}s`;
-    };
-    const uptimeStr = formatUptimeLocal(a.startTime);
-
-    const now = new Date();
-    const wibDate = new Date(now.getTime() + (420 + now.getTimezoneOffset()) * 60000);
-    let dateStr = wibDate.toLocaleString('en-GB', { hour12: false }) + ' WIB';
-    try {
-        const d = String(wibDate.getDate()).padStart(2, '0');
-        const m = String(wibDate.getMonth() + 1).padStart(2, '0');
-        const y = wibDate.getFullYear();
-        const t = wibDate.toTimeString().split(' ')[0];
-        dateStr = `${d}/${m}/${y} ${t} WIB`;
-    } catch (e) { }
-
-    const pairBBal = activePairMode === 'CETH' ? (a.ceth ?? 0) : a.usdcx;
-    const balLine = ` <code>${a.cc.toFixed(5)} CC</code>  |  <code>${pairBBal.toFixed(pairDec)} ${pairLabel}</code>`;
-
-    // TX Detail block
-    let txBlock = '';
-    const fee = swapData.fee ?? 0;
-    const slippagePct = (swapData.slippageBps ?? 200) / 100;
-    const userTx = swapData.userTxId || '';
-    const solverTx = swapData.solverTxId || '';
-    txBlock += `\n\n<b> TX Detail</b>\n`;
-    txBlock += `   Dir     : <code>OUT</code>\n`;
-    txBlock += `   Amount  : <code>${parseFloat(sendAmount || 0).toFixed(4)} ${fromSymbol}</code>\n`;
-    txBlock += `   Fee TX  : <code>${parseFloat(fee).toFixed(6)} ${fromSymbol}</code>\n`;
-    txBlock += `   Slippage: <code>${slippagePct.toFixed(1)}%</code>\n`;
-    if (userTx) txBlock += `   <a href='https://ccview.io/updates/${userTx}/'>Send TX</a>\n`;
-    if (solverTx) txBlock += `   <a href='https://ccview.io/updates/${solverTx}/'>Recv TX</a>\n`;
-
-    // Leaderboard block with delta
-    let lbBlock = '';
-    if (a.rank > 0 || a.monthReward > 0) {
-        const medal = a.rank === 1 ? '' : a.rank === 2 ? '' : a.rank === 3 ? '' : '';
-        const deltaRew = a.diffReward > 0 ? ` <code>(+${a.diffReward.toFixed(6)})</code>` : '';
-        lbBlock += `\n\n<b> Leaderboard</b>\n`;
-        lbBlock += `  ${medal} Rank      : <b>#${a.rank}</b>\n`;
-        lbBlock += `   Swaps     : <code>${a.monthTxns}</code>\n`;
-        lbBlock += `   Volume    : <code>$${a.monthVolume.toFixed(2)}</code>\n`;
-        lbBlock += `   Accrued   : <code>${a.pendingReward.toFixed(6)} CC</code>${deltaRew}\n`;
-        lbBlock += `   Paid      : <code>${(a.totalReward - a.pendingReward).toFixed(6)} CC</code>\n`;
-        lbBlock += `   Total     : <code>${a.totalReward.toFixed(6)} CC</code>`;
-    }
-
-    const text = ` <b>Swap #${a.totalSwaps} done</b>\n` +
-        ` ${a.name}\n` +
-        `──────────────────\n` +
-        ` <code>${parseFloat(sendAmount || 0).toFixed(4)} ${fromSymbol}</code>  →  <code>${parseFloat(receiveAmount || 0).toFixed(pairDec)} ${toSymbol}</code>\n` +
-        ` next: <code>${nextText}</code>\n` +
-        ` ${uptimeStr}\n\n` +
-        `${balLine}` +
-        `${txBlock}${lbBlock}\n<i>${dateStr}</i>`;
-
-    await sendTelegramMessage(text);
-}
-
-// ── Round Notification (Swap + Bulkback + P/L) ──────────────────────────
-
-async function sendRoundNotification(ctx, round, rounds, info) {
-    if (!config.telegram?.enabled) return;
-    const { index } = ctx;
-    const a = dashboard.accounts[index];
-    if (!a) return;
-
-    const pairLabel = getPairBLabel();
-    const pairDec = getPairBDecimals();
-    const { swapAmount, swapResult, bulkResult, bulkbackSuccess, ccBeforeSwap, ccAfterBulk, spread, rewardEstimate, netPL } = info;
-
-    const swapData = (swapResult && typeof swapResult === 'object') ? swapResult : {};
-    const bulkData = (bulkResult && typeof bulkResult === 'object') ? bulkResult : {};
-
-    const formatUptimeLocal = (startMs) => {
-        const sec = Math.floor((Date.now() - startMs) / 1000);
-        const h = Math.floor(sec / 3600);
-        const m = Math.floor((sec % 3600) / 60);
-        const s = sec % 60;
-        if (h > 0) return `${h}h${String(m).padStart(2, '0')}m${String(s).padStart(2, '0')}s`;
-        return `${m}m${String(s).padStart(2, '0')}s`;
-    };
-    const uptimeStr = formatUptimeLocal(a.startTime);
-
-    const now = new Date();
-    const wibDate = new Date(now.getTime() + (420 + now.getTimezoneOffset()) * 60000);
-    let dateStr;
-    try {
-        const d = String(wibDate.getDate()).padStart(2, '0');
-        const mo = String(wibDate.getMonth() + 1).padStart(2, '0');
-        const y = wibDate.getFullYear();
-        const t = wibDate.toTimeString().split(' ')[0];
-        dateStr = `${d}/${mo}/${y} ${t} WIB`;
-    } catch { dateStr = wibDate.toLocaleString('en-GB', { hour12: false }) + ' WIB'; }
-
-    const pairBBal = activePairMode === 'CETH' ? (a.ceth ?? 0) : a.usdcx;
-    const plIcon = netPL >= 0 ? '' : '';
-    const plSign = netPL >= 0 ? '+' : '';
-
-    // ── Build message ──
-    let text = ` <b>Round ${round}/${rounds} Complete</b>\n`;
-    text += ` ${a.name}\n`;
-    text += `──────────────────\n`;
-
-    // Swap line: CC → CETH/USDCx
-    text += ` <code>${parseFloat(swapAmount || 0).toFixed(4)} CC</code>  →  <code>${parseFloat(swapData.receiveAmount || 0).toFixed(pairDec)} ${pairLabel}</code>\n`;
-
-    // Bulkback line: CETH/USDCx → CC
-    if (bulkbackSuccess && bulkData.receiveAmount) {
-        text += ` <code>${parseFloat(bulkData.sendAmount || 0).toFixed(pairDec)} ${pairLabel}</code>  →  <code>${parseFloat(bulkData.receiveAmount || 0).toFixed(4)} CC</code>\n`;
-    } else {
-        text += ` <i>Bulkback pending/failed</i>\n`;
-    }
-
-    text += `──────────────────\n`;
-
-    // P/L block
-    if (bulkbackSuccess && spread !== 0) {
-        text += ` Spread  : <code>-${spread.toFixed(4)} CC</code>\n`;
-        text += ` Reward  : <code>+${rewardEstimate.toFixed(2)} CC</code> <i>(est)</i>\n`;
-        text += ` Net P/L : <code>${plSign}${netPL.toFixed(4)} CC</code> ${plIcon}\n`;
-    } else {
-        text += ` P/L     : <i>bulkback pending</i>\n`;
-    }
-    text += `──────────────────\n`;
-
-    // Balance
-    text += ` <code>${a.cc.toFixed(4)} CC</code>  |  <code>${pairBBal.toFixed(pairDec)} ${pairLabel}</code>\n`;
-    text += ` ${uptimeStr}\n`;
-
-    // Leaderboard compact
-    if (a.rank > 0) {
-        const medal = a.rank === 1 ? '' : a.rank === 2 ? '' : a.rank === 3 ? '' : '';
-        const deltaRew = a.diffReward > 0 ? ` (+${a.diffReward.toFixed(4)})` : '';
-        text += `${medal} #${a.rank} |  ${a.monthTxns} swaps |  ${a.pendingReward.toFixed(4)} CC${deltaRew}\n`;
-    }
-
-    text += `<i>${dateStr}</i>`;
-
-    await sendTelegramMessage(text);
-}
-
-
-// ── Cycle Notification (Full Circular Swap P/L + Rebates) ────────────────
-
-async function sendCycleNotification(ctx, cycle, rounds, info) {
-    if (!config.telegram?.enabled) return;
-    const { index } = ctx;
-    const a = dashboard.accounts[index];
-    if (!a) return;
-
-    const { ccCycleStart, ccCycleEnd, spreadLoss, rebatesBefore, rebatesAfter, rewardGain, netPL, stepFailed, totalSwaps: swaps } = info;
-
-    const formatUptimeLocal = (startMs) => {
-        const sec = Math.floor((Date.now() - startMs) / 1000);
-        const h = Math.floor(sec / 3600);
-        const m = Math.floor((sec % 3600) / 60);
-        const s = sec % 60;
-        if (h > 0) return `${h}h${String(m).padStart(2, '0')}m${String(s).padStart(2, '0')}s`;
-        return `${m}m${String(s).padStart(2, '0')}s`;
-    };
-    const uptimeStr = formatUptimeLocal(a.startTime);
-
-    const now = new Date();
-    const wibDate = new Date(now.getTime() + (420 + now.getTimezoneOffset()) * 60000);
-    let dateStr;
-    try {
-        const d = String(wibDate.getDate()).padStart(2, '0');
-        const mo = String(wibDate.getMonth() + 1).padStart(2, '0');
-        const y = wibDate.getFullYear();
-        const t = wibDate.toTimeString().split(' ')[0];
-        dateStr = `${d}/${mo}/${y} ${t} WIB`;
-    } catch { dateStr = wibDate.toLocaleString('en-GB', { hour12: false }) + ' WIB'; }
-
-    const plIcon = netPL >= 0 ? '' : '';
-    const plSign = netPL >= 0 ? '+' : '';
-    const status = stepFailed ? ' INCOMPLETE' : ' SELESAI';
-
-    let text = ` <b>Siklus #${cycle}/${rounds} ${status}</b>\n`;
-    text += ` ${a.name}\n`;
-    text += `──────────────────\n`;
-    text += ` CC Awal     : <code>${ccCycleStart.toFixed(4)} CC</code>\n`;
-    text += ` CC Akhir    : <code>${ccCycleEnd.toFixed(4)} CC</code>\n`;
-    text += ` Spread Loss : <code>-${spreadLoss.toFixed(4)} CC</code>\n`;
-    text += `──────────────────\n`;
-    text += ` Rebates Before: <code>${rebatesBefore.toFixed(4)} CC</code>\n`;
-    text += ` Rebates After : <code>${rebatesAfter.toFixed(4)} CC</code>\n`;
-    text += ` Reward Gained : <code>+${rewardGain.toFixed(4)} CC</code>\n`;
-    text += `──────────────────\n`;
-    text += ` Net P/L: <code>${plSign}${netPL.toFixed(4)} CC</code> ${plIcon} (${netPL >= 0 ? 'UNTUNG' : 'RUGI'})\n`;
-    text += `──────────────────\n`;
-    text += ` <code>${(a.cc ?? 0).toFixed(4)} CC</code> | <code>${(a.usdcx ?? 0).toFixed(4)} USDCx</code> | <code>${(a.ceth ?? 0).toFixed(10)} CETH</code>\n`;
-    text += ` Total swaps: ${swaps}\n`;
-    text += ` ${uptimeStr}\n`;
-
-    if (a.rank > 0) {
-        const medal = a.rank === 1 ? '' : a.rank === 2 ? '' : a.rank === 3 ? '' : '';
-        const deltaRew = a.diffReward > 0 ? ` (+${a.diffReward.toFixed(4)})` : '';
-        text += `${medal} #${a.rank} |  ${a.monthTxns} swaps |  ${a.pendingReward.toFixed(4)} CC${deltaRew}\n`;
-    }
-
-    text += `<i>${dateStr}</i>`;
-    await sendTelegramMessage(text);
-}
-
 // ── Random Delay Helpers ─────────────────────────────────────────────────
 function getRandomDelay(minSec, maxSec) {
     return Math.floor(Math.random() * (maxSec - minSec + 1)) + minSec;
@@ -403,8 +192,7 @@ function formatDelayTime(seconds) {
 async function fetchDynamicMinSwap(swapApi, log) {
     if (!dynamicMinSwap.enabled) return config.swap.min_amount;
 
-    const { pair_a } = config.swap;
-    const pair_b = getActivePairB();
+    const { pair_a, pair_b } = config.swap;
 
     try {
         // Fetch minimum dari API
@@ -413,7 +201,7 @@ async function fetchDynamicMinSwap(swapApi, log) {
         if (rawMin !== null && !isNaN(rawMin) && rawMin > 0) {
             dynamicMinSwap.lastRawMin = rawMin;  // simpan untuk bulk-back check
             const swapAmount = rawMin + dynamicMinSwap.extraCc;
-            log(` Min: ${rawMin}CC + ${dynamicMinSwap.extraCc}CC = ${swapAmount.toFixed(2)}CC`);
+            log(`📊 Min: ${rawMin}CC + ${dynamicMinSwap.extraCc}CC = ${swapAmount.toFixed(2)}CC`);
             return swapAmount;
         }
     } catch (err) {
@@ -423,23 +211,6 @@ async function fetchDynamicMinSwap(swapApi, log) {
     // Fallback jika API gagal
     const fallbackAmount = dynamicMinSwap.fallbackMin + dynamicMinSwap.extraCc;
     return fallbackAmount;
-}
-
-
-// ── Fetch minimum for a SPECIFIC pair (for CETH leg) ─────────────────────
-async function fetchMinSwapForPair(swapApi, log, fromPair, toPair) {
-    try {
-        const rawMin = await swapApi.getMinimumSwap(fromPair.chain, fromPair.asset, toPair.chain, toPair.asset);
-        if (rawMin !== null && !isNaN(rawMin) && rawMin > 0) {
-            const extra = dynamicMinSwap.enabled ? dynamicMinSwap.extraCc : 0;
-            const swapAmount = rawMin + extra;
-            log(` Min ${fromPair.label}→${toPair.label}: ${rawMin}CC + ${extra}CC = ${swapAmount.toFixed(2)}CC`);
-            return swapAmount;
-        }
-    } catch { /* silent */ }
-    return dynamicMinSwap.enabled
-        ? (dynamicMinSwap.fallbackMin + dynamicMinSwap.extraCc)
-        : config.swap.min_amount;
 }
 
 // ── Get Raw Minimum for Bulk-back Check ──────────────────────────────────
@@ -453,8 +224,7 @@ function getRawMinimumForBulkBack() {
 async function checkBulkBackShortage(swapApi, usdcxBalance, log) {
     if (!dynamicMinSwap.enabled) return null;
 
-    const { pair_a } = config.swap;
-    const pair_b = getActivePairB();
+    const { pair_a, pair_b } = config.swap;
     const minCC = getRawMinimumForBulkBack(); // pakai raw minimum (tanpa extra)
 
     try {
@@ -485,6 +255,59 @@ async function checkBulkBackShortage(swapApi, usdcxBalance, log) {
     }
 
     return null;
+}
+
+// ── Try Bulk CETH → CC (rescue ketika CC & USDCX kurang) ────────────────
+// Cek saldo CETH; jika ada, langsung swap semua ke CC.
+// Return true kalau swap CETH→CC berhasil (atau setidaknya dieksekusi), false kalau tidak ada CETH.
+async function tryBulkCeth(ctx, holdingsCacheRef = {}) {
+    const { session, walletApi, swapApi, log, index } = ctx;
+    const pair_c = config.swap.pair_c;
+    const pair_a = config.swap.pair_a;
+    if (!pair_c) return false;
+
+    try {
+        const { holdings: h } = await session.withRetry(
+            () => walletApi.getBalance(session.walletToken), 'wallet', walletApi, swapApi, log
+        );
+        const cethBal = getBalanceFor(h, pair_c.asset);
+        if (cethBal <= 0) return false;
+
+        log(`💱 ${pair_c.label} ada (${cethBal}), bulk-back ${pair_c.label}→CC`);
+        if (typeof index === 'number') dashboard.update(index, { status: `bulk ${pair_c.label}` });
+
+        const adminId = getInstrumentAdminId(h, pair_c.asset);
+        const result = await executeSwap(ctx, {
+            fromChain: pair_c.chain, fromAsset: pair_c.asset,
+            toChain: pair_a.chain, toAsset: pair_a.asset,
+            amount: cethBal, fromLabel: pair_c.label, toLabel: pair_a.label,
+            instrumentAdminId: adminId,
+        }, { pollTimeoutMinutes: 10 });
+
+        if (result && !result.error) {
+            log(`✅ Bulk ${pair_c.label}: +${result.receiveAmount || '?'} CC`);
+            if (typeof index === 'number') {
+                dashboard.update(index, {
+                    swapsUtCC: (dashboard.accounts[index].swapsUtCC || 0) + 1,
+                    swapsCETHtoCC: (dashboard.accounts[index].swapsCETHtoCC || 0) + 1,
+                    lastSwapDir: `${pair_c.label}↩`,
+                });
+            }
+            // Update cache holdings
+            try {
+                const { holdings: h2 } = await session.withRetry(
+                    () => walletApi.getBalance(session.walletToken), 'wallet', walletApi, swapApi, log
+                );
+                if (h2 && holdingsCacheRef) Object.assign(holdingsCacheRef, h2);
+            } catch { /* ignore */ }
+            return true;
+        }
+        log(`⚠️ Bulk ${pair_c.label}→CC gagal`);
+        return false;
+    } catch (err) {
+        log(`⚠️ Bulk ${pair_c.label} error: ${formatError(err)}`);
+        return false;
+    }
 }
 
 // ── Retry on Network Error ──────────────────────────────────────────────
@@ -521,7 +344,7 @@ function getEscalatingDelay(attempt, delays) {
     return delays[delays.length - 1]; // max delay forever
 }
 
-async function retryOnNetwork(fn, { maxRetries = Infinity, baseDelay = 3, label = '', log = null } = {}) {
+async function retryOnNetwork(fn, { maxRetries = Infinity, baseDelay = 3, label = '', log = null, onRateLimitRetry = null } = {}) {
     let rateLimitAttempt = 0;
     const rateLimitInitialDelayMin = config.retry?.rate_limit_initial_delay_minutes ?? 61;
     const rateLimitDelays = config.retry?.rate_limit_delays || [15, 30, 60];
@@ -543,14 +366,17 @@ async function retryOnNetwork(fn, { maxRetries = Infinity, baseDelay = 3, label 
                 if (rateLimitAttempt === 0) {
                     // First 429: delay 61 minutes
                     delay = rateLimitInitialDelayMin * 60; // convert to seconds
-                    if (log) log(` Rate limited — waiting ${rateLimitInitialDelayMin} minutes (first hit)`);
+                    if (log) log(`⏳ Rate limited — waiting ${rateLimitInitialDelayMin} minutes (first hit)`);
                 } else {
                     // Subsequent 429s: use escalating delays
                     delay = getEscalatingDelay(rateLimitAttempt - 1, rateLimitDelays);
-                    if (log) log(` Rate limited — ${delay}s (#${rateLimitAttempt})`);
+                    if (log) log(`⏳ Rate limited — ${delay}s (#${rateLimitAttempt})`);
                 }
                 rateLimitAttempt++;
                 await sleep(delay);
+                if (typeof onRateLimitRetry === 'function') {
+                    await onRateLimitRetry({ attempt: rateLimitAttempt, delay, err });
+                }
                 continue;
             }
 
@@ -567,7 +393,7 @@ async function retryOnNetwork(fn, { maxRetries = Infinity, baseDelay = 3, label 
             if (isFatalConn) {
                 consecutiveTimeouts++;
                 if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
-                    if (log) log(` ${MAX_CONSECUTIVE_TIMEOUTS}x conn fail — soft restart`);
+                    if (log) log(`❌ ${MAX_CONSECUTIVE_TIMEOUTS}x conn fail — soft restart`);
                     throw err; // trigger soft restart via runAccount
                 }
             } else {
@@ -577,7 +403,7 @@ async function retryOnNetwork(fn, { maxRetries = Infinity, baseDelay = 3, label 
             const rawDelay = Math.min(baseDelay * Math.pow(2, attempt), 30);
             const jitter = rawDelay * (0.7 + Math.random() * 0.6); // ±30% jitter
             const delay = Math.round(jitter * 10) / 10;
-            if (log) log(` ${formatError(err)} — ${delay}s (#${attempt + 1})`);
+            if (log) log(`🔄 ${formatError(err)} — ${delay}s (#${attempt + 1})`);
             await sleep(delay);
         }
     }
@@ -701,7 +527,8 @@ function createWalletApi(ax) {
 }
 
 function createSwapApi(ax) {
-    const h = BASE_HEADERS;
+    // Swap API requires Origin: https://exchange.cantor8.tech (not wallet.cantor8.tech)
+    const h = SWAP_HEADERS;
     const auth = (token) => ({ ...h, Authorization: `Bearer ${token}` });
     return {
         getNonce: () =>
@@ -795,7 +622,7 @@ function createSwapApi(ax) {
     };
 }
 
-// ── Split-Screen UI Utilities (ported from handl.js) ─────────────────────
+// ── UI helpers (port from ref.js) ────────────────────────────────────────
 
 const ansiRegex = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
 const SEP = Symbol('separator');
@@ -903,8 +730,8 @@ function wrapLine(text, maxW) {
 
 const MAX_ACC_LOGS = 5;
 const MAX_LOG_LINES = Math.max(5, Number(config.max_log_lines) || 50);
-const DASHBOARD_LOG_ROWS = MAX_LOG_LINES; // max log rows in right panel
-const MAX_GLOBAL_LOGS = MAX_LOG_LINES; // execution logs in right panel
+const DASHBOARD_LOG_ROWS = MAX_LOG_LINES;
+const MAX_GLOBAL_LOGS = MAX_LOG_LINES;
 
 const dashboard = {
     accounts: [],
@@ -919,6 +746,7 @@ const dashboard = {
             startTime: Date.now(),
             cc: 0, usdcx: 0, ceth: 0,
             swapsCCtoU: 0, swapsUtCC: 0,
+            swapsUtoCETH: 0, swapsCETHtoCC: 0,
             maxCCtoU: config.swap.rounds || 0, maxUtCC: 0,
             totalSwaps: 0, lastSwapDir: '',
             monthReward: 0, monthVolume: 0, monthTxns: 0,
@@ -942,7 +770,6 @@ const dashboard = {
 
     log(index, msg) {
         const a = this.accounts[index];
-        // Filter noisy lines that break the table layout (separators, batch dividers, blank lines)
         const stripped = stripAnsi(String(msg)).trim();
         if (!stripped) { this._scheduleRender(); return; }
         if (/^[═━─-]{3,}$/.test(stripped)) { this._scheduleRender(); return; }
@@ -950,7 +777,6 @@ const dashboard = {
         const cleanMsg = String(msg).replace(/^\n+/, '');
         a.logs.push(cleanMsg);
         while (a.logs.length > MAX_ACC_LOGS) a.logs.shift();
-        // Also push to global execution logs (no timestamp — short and table-friendly)
         this.globalLogs.push(`${chalk.cyan(`[${a.name}]`)} ${cleanMsg}`);
         while (this.globalLogs.length > MAX_GLOBAL_LOGS) this.globalLogs.shift();
         this._scheduleRender();
@@ -972,18 +798,13 @@ const dashboard = {
         const headerTime = new Date().toLocaleTimeString('en-GB', { hour12: false });
         const modeLabel = 'CC <> USDCx <> CETH';
 
-        // ── Build LEFT panel lines ──
         const left = [];
-
-        left.push(centerToWidth(chalk.bold.hex('#67E8F9')('Cantor8 Bot V2'), L));
+        left.push(centerToWidth(chalk.bold.hex('#67E8F9')('Cantor8 Bot V2.1'), L));
         left.push(SEP);
-
-        // Status
         left.push(` ${chalk.hex('#67E8F9')('Mode')} ${chalk.white(modeLabel)}`);
         left.push(` ${chalk.hex('#67E8F9')('Acc')}  ${chalk.white(String(this.accounts.length))}  ${chalk.hex('#67E8F9')('Time')} ${chalk.white(headerTime)}`);
         left.push(SEP);
 
-        // Per-account (adaptive: compact when >10 accounts)
         const compact = this.accounts.length > 10;
         let totCC = 0, totUSDCx = 0, totCETH = 0, totReward = 0, totDelta = 0, totSwaps = 0;
 
@@ -999,7 +820,6 @@ const dashboard = {
             const deltaFmt = deltaVal >= 0 ? `+${deltaVal.toFixed(1)}` : `${deltaVal.toFixed(1)}`;
             const upStr = formatUptime(a.startTime);
 
-            // Color coding
             const ccColor = a.cc >= 25 ? chalk.green : a.cc >= 10 ? chalk.yellow : chalk.red;
             const deltaColor = deltaVal > 0 ? chalk.green : deltaVal < 0 ? chalk.red : chalk.gray;
             const statusColor = a.status === 'swapping' ? chalk.cyan :
@@ -1011,13 +831,11 @@ const dashboard = {
                                     chalk.white;
 
             if (compact) {
-                // Compact: 2 lines per account
                 const num = chalk.hex('#6EE7B7')(String(a.num).padStart(2) + '.');
                 const st = (a.status || 'init').slice(0, 8);
                 left.push(` ${num} ${ccColor(a.cc.toFixed(1))}CC ${chalk.blue(a.usdcx.toFixed(1))}USDC ${chalk.cyan((a.ceth || 0).toFixed(4))}cETH`);
                 left.push(`     ${chalk.gray(upStr)} ${statusColor(st)} ${deltaColor(deltaFmt)}`);
             } else {
-                // Detailed: 3 lines per account
                 const proxyTag = a.proxyIp ? chalk.gray(` [${a.proxyIp}]`) : a.proxyHost ? chalk.gray(` [${a.proxyHost}]`) : '';
                 left.push(` ${chalk.hex('#6EE7B7')(String(a.num) + '.')} ${chalk.white(a.name)}${proxyTag}`);
                 left.push(`    ${chalk.hex('#A7F3D0')('CC')} ${ccColor(a.cc.toFixed(1))} ${chalk.hex('#A7F3D0')('USDC')} ${chalk.blue(a.usdcx.toFixed(1))} ${chalk.hex('#A7F3D0')('cETH')} ${chalk.cyan((a.ceth || 0).toFixed(4))}`);
@@ -1027,19 +845,15 @@ const dashboard = {
 
         left.push(SEP);
 
-        // Totals
         const totDeltaFmt = totDelta >= 0 ? `+${totDelta.toFixed(2)}` : `${totDelta.toFixed(2)}`;
         left.push(` ${chalk.bold.hex('#FBBF24')('TOT')} ${chalk.hex('#67E8F9')('CC')} ${chalk.green.bold(totCC.toFixed(2))} ${chalk.hex('#67E8F9')('Ux')} ${chalk.blue.bold(totUSDCx.toFixed(4))}`);
         left.push(`     ${chalk.hex('#67E8F9')('cE')} ${chalk.cyan.bold(totCETH.toFixed(6))} ${chalk.hex('#67E8F9')('Sw')} ${chalk.white.bold(String(totSwaps))}`);
         left.push(`     ${chalk.hex('#67E8F9')('Rw')} ${chalk.green.bold(totReward.toFixed(2))} ${chalk.hex('#67E8F9')('D')} ${chalk.green.bold(totDeltaFmt)}`);
 
-        // ── Build RIGHT panel lines ──
         const right = [];
-
         right.push(centerToWidth(chalk.bold.hex('#FBBF24')('Activity Log'), R));
         right.push(SEP);
 
-        // Wrap log lines into multiple rows (no truncation)
         const allLogRows = [];
         const recentLogs = this.globalLogs.slice(-DASHBOARD_LOG_ROWS);
         for (const entry of recentLogs) {
@@ -1048,21 +862,15 @@ const dashboard = {
                 allLogRows.push(row);
             }
         }
-        // Take last N rows to fit panel
         const visibleLogRows = allLogRows.slice(-DASHBOARD_LOG_ROWS);
-        for (const row of visibleLogRows) {
-            right.push(row);
-        }
+        for (const row of visibleLogRows) right.push(row);
         const emptyRows = Math.max(0, DASHBOARD_LOG_ROWS - visibleLogRows.length);
-        for (let i = 0; i < emptyRows; i++) {
-            right.push('');
-        }
+        for (let i = 0; i < emptyRows; i++) right.push('');
 
-        // ── Merge and render side by side ──
         const maxRows = Math.max(left.length, right.length);
         const c = chalk.hex('#555');
 
-        console.log(c(`\u250c${'─'.repeat(L)}\u252c${'─'.repeat(R)}\u2510`));
+        console.log(c(`┌${'─'.repeat(L)}┬${'─'.repeat(R)}┐`));
 
         for (let i = 0; i < maxRows; i++) {
             const lVal = left[i] ?? '';
@@ -1071,17 +879,17 @@ const dashboard = {
             const rIsSep = rVal === SEP;
 
             if (lIsSep && rIsSep) {
-                console.log(c(`\u251c${'─'.repeat(L)}\u253c${'─'.repeat(R)}\u2524`));
+                console.log(c(`├${'─'.repeat(L)}┼${'─'.repeat(R)}┤`));
             } else if (lIsSep) {
-                console.log(c(`\u251c${'─'.repeat(L)}\u2524`) + padCell(rVal, R) + c('\u2502'));
+                console.log(c(`├${'─'.repeat(L)}┤`) + padCell(rVal, R) + c('│'));
             } else if (rIsSep) {
-                console.log(c('\u2502') + padCell(lVal, L) + c(`\u251c${'─'.repeat(R)}\u2524`));
+                console.log(c('│') + padCell(lVal, L) + c(`├${'─'.repeat(R)}┤`));
             } else {
-                console.log(c('\u2502') + padCell(lVal, L) + c('\u2502') + padCell(rVal, R) + c('\u2502'));
+                console.log(c('│') + padCell(lVal, L) + c('│') + padCell(rVal, R) + c('│'));
             }
         }
 
-        console.log(c(`\u2514${'─'.repeat(L)}\u2534${'─'.repeat(R)}\u2518`));
+        console.log(c(`└${'─'.repeat(L)}┴${'─'.repeat(R)}┘`));
     },
 
     startAutoRefresh() {
@@ -1108,7 +916,7 @@ function createSession() {
         swapLoginTime: 0,
 
         async refreshWalletToken(walletApi, log) {
-            log(' Refreshing wallet token...');
+            log('🔑 Refreshing wallet token...');
             await retryOnNetwork(async () => {
                 const { challenge } = await walletApi.getChallenge(this.partyId);
                 const sig = toHex(signMessage(this.keyPair.privateKey, challenge));
@@ -1119,7 +927,7 @@ function createSession() {
         },
 
         async refreshSwapToken(swapApi, log) {
-            log(' Refreshing swap token...');
+            log('🔑 Refreshing swap token...');
             await retryOnNetwork(async () => {
                 const { nonce } = await swapApi.getNonce();
                 const swapAuth = await swapApi.bindSignature(nonce, this.partyId);
@@ -1134,19 +942,19 @@ function createSession() {
                 try {
                     await this.refreshWalletToken(walletApi, log);
                 } catch (err) {
-                    log(` Wallet token refresh failed: ${formatError(err)}`);
+                    log(`⚠️ Wallet token refresh failed: ${formatError(err)}`);
                 }
             }
             if (this.swapLoginTime && (now - this.swapLoginTime) > TOKEN_MAX_AGE_MS) {
                 try {
                     await this.refreshSwapToken(swapApi, log);
                 } catch (err) {
-                    log(` Swap token refresh failed: ${formatError(err)}`);
+                    log(`⚠️ Swap token refresh failed: ${formatError(err)}`);
                 }
             }
         },
 
-        async withRetry(fn, tokenType, walletApi, swapApi, log) {
+        async withRetry(fn, tokenType, walletApi, swapApi, log, retryOptions = {}) {
             // Wrap with network retry first, then handle 401 inside
             return await retryOnNetwork(async () => {
                 try {
@@ -1162,7 +970,7 @@ function createSession() {
                     }
                     throw err;
                 }
-            }, { maxRetries: 5, baseDelay: 3, label: 'apiCall', log });
+            }, { maxRetries: 5, baseDelay: 3, label: 'apiCall', log, ...retryOptions });
         },
     };
 }
@@ -1175,7 +983,7 @@ async function resolveActiveOrder(ctx) {
     try {
         const active = await swapApi.getActiveOrder(session.swapToken, {});
         if (!active?.orderId || TERMINAL_S.includes(active.status)) return false;
-        log(` Active order ${shortId(active.orderId)} (${active.status}), polling...`);
+        log(`🔄 Active order ${shortId(active.orderId)} (${active.status}), polling...`);
         for (let rp = 0; rp < 60; rp++) {
             await sleep(5);
             if (rp % 12 === 0 && rp > 0) await session.ensureFreshTokens(walletApi, swapApi, log);
@@ -1184,14 +992,14 @@ async function resolveActiveOrder(ctx) {
                     () => swapApi.getOrderStatus(session.swapToken, active.orderId),
                     { maxRetries: 3, baseDelay: 3, label: 'resolveOrder', log }
                 );
-                log(` ${shortId(active.orderId)} → ${st.status}`);
+                log(`🔄 ${shortId(active.orderId)} → ${st.status}`);
                 if (TERMINAL_S.includes(st.status)) {
-                    log(` Order ${shortId(active.orderId)} → ${st.status}`);
+                    log(`✅ Order ${shortId(active.orderId)} → ${st.status}`);
                     return true;
                 }
             } catch (pe) {
                 if (pe.response?.status === 401) { await session.refreshSwapToken(swapApi, log); continue; }
-                log(` resolveOrder poll error: ${formatError(pe)}`);
+                log(`⚠️ resolveOrder poll error: ${formatError(pe)}`);
                 break;
             }
         }
@@ -1215,7 +1023,7 @@ async function runAccount(accConfig, index) {
         } catch (err) {
             // Error 500+ → soft restart immediately (short delay)
             if (err.response?.status >= 500) {
-                log(` [${err.response.status}] soft restart 5s`);
+                log(`🔄 [${err.response.status}] soft restart 5s`);
                 dashboard.update(index, { status: 'soft-restart' });
                 await sleep(5);
                 accountAttempt = Math.max(1, accountAttempt - 1); // don't escalate delay for 500
@@ -1224,16 +1032,16 @@ async function runAccount(accConfig, index) {
 
             // ERR_BAD_RESPONSE → soft restart immediately
             if (err.code === 'ERR_BAD_RESPONSE' || err.message?.includes('ERR_BAD_RESPONSE')) {
-                log(` [ERR_BAD_RESPONSE] soft restart 5s`);
+                log(`🔄 [ERR_BAD_RESPONSE] soft restart 5s`);
                 dashboard.update(index, { status: 'soft-restart' });
                 await sleep(5);
                 accountAttempt = Math.max(1, accountAttempt - 1);
                 continue;
             }
 
-            log(` ${formatError(err)}`);
+            log(`❌ ${formatError(err)}`);
             const delay = Math.min(ACCOUNT_RETRY_BASE_DELAY * Math.pow(1.5, accountAttempt - 1), 120);
-            log(` Restart ${Math.round(delay)}s (#${accountAttempt})`);
+            log(`🔄 Restart ${Math.round(delay)}s (#${accountAttempt})`);
             dashboard.update(index, { status: `restart #${accountAttempt}` });
             await sleep(delay);
         }
@@ -1273,13 +1081,13 @@ async function runAccountOnce(accConfig, index, name, log) {
 
     // Step 1: Derive keys
     dashboard.update(index, { status: 'deriving' });
-    log(' Deriving key pairs...');
+    log('🔑 Deriving key pairs...');
     const keyPairs = generateKeyPairs(accConfig.mnemonic);
-    log(` ${keyPairs.length} keys derived`);
+    log(`🔑 ${keyPairs.length} keys derived`);
 
     // Step 2: Recover account (with network retry)
     dashboard.update(index, { status: 'recovering' });
-    log(' Recovering account...');
+    log('🔍 Recovering account...');
     const recovery = await retryOnNetwork(
         () => walletApi.recoverAccount(keyPairs.map(k => k.publicKeyHex)),
         { maxRetries: 5, baseDelay: 3, label: 'recover', log }
@@ -1287,11 +1095,11 @@ async function runAccountOnce(accConfig, index, name, log) {
     const matchIdx = (recovery.results || []).findIndex(r => r !== null);
     if (matchIdx === -1) throw new Error('No account found for this mnemonic');
     const acct = recovery.results[matchIdx];
-    log(` Party: ${shortId(acct.party_id)}`);
+    log(`🆔 Party: ${shortId(acct.party_id)}`);
 
     // Step 3: Login (with network retry)
     dashboard.update(index, { status: 'auth', nonce: true });
-    log(' Authenticating...');
+    log('🔐 Authenticating...');
     session.partyId = acct.party_id;
     session.keyPairs = keyPairs;
     session.matchIdx = matchIdx;
@@ -1312,28 +1120,28 @@ async function runAccountOnce(accConfig, index, name, log) {
                     .toLowerCase().includes('challenge');
             if (is400Challenge) {
                 // Challenge expired in transit — fetch fresh one immediately, no wait
-                log(` [login] Challenge expired, retrying immediately... (attempt ${loginAttempt})`);
+                log(`🔄 [login] Challenge expired, retrying immediately... (attempt ${loginAttempt})`);
                 continue;
             }
             if (!isRetryableError(err)) throw err;
             const delay = Math.min(3 * Math.pow(2, loginAttempt - 1), 30);
-            log(` [login] ${formatError(err)} (attempt ${loginAttempt}, wait ${delay}s)`);
+            log(`🔄 [login] ${formatError(err)} (attempt ${loginAttempt}, wait ${delay}s)`);
             await sleep(delay);
         }
     }
-    log(' Authenticated');
+    log('✅ Authenticated');
 
     // Step 3b: Post-login registration checks (HAR flow)
     try {
         const regStatus = await walletApi.getRegisterStatus(session.walletToken);
-        log(` Registration: ${regStatus.is_registered ? '' : ''}`);
+        log(`📋 Registration: ${regStatus.is_registered ? '✅' : '⏳'}`);
         await walletApi.postConfirmV2(session.walletToken);
         await walletApi.getOutgoingExpired(session.walletToken);
     } catch { /* non-critical */ }
 
     // Step 4: Dashboard data
     const ctx = { session, walletApi, swapApi, log, name, index, ax };
-    log(' Fetching balance & stats...');
+    log('📊 Fetching balance & stats...');
     const holdings = await refreshAccountData(ctx);
 
     // Step 4b: Start background refresh for balance & reward
@@ -1345,7 +1153,7 @@ async function runAccountOnce(accConfig, index, name, log) {
             dashboard.update(index, { swap: true });
             await performSwap(ctx, holdings);
         } else {
-            log(' Swap disabled');
+            log('⏸ Swap disabled');
             dashboard.update(index, { status: 'idle' });
         }
     } finally {
@@ -1353,7 +1161,7 @@ async function runAccountOnce(accConfig, index, name, log) {
         stopBackgroundRefresh(bgRefreshId);
     }
 
-    log(' Completed');
+    log('🏁 Completed');
     dashboard.update(index, { status: 'done' });
 }
 
@@ -1368,9 +1176,9 @@ async function refreshAccountData(ctx) {
 
     let cc = 0, usdcx = 0, ceth = 0;
     for (const [tok, info] of Object.entries(holdings)) {
-        if (CC_ASSET_KEYS.includes(tok)) cc = info.balance || 0;
-        if (USDCX_ASSET_KEYS.includes(tok)) usdcx = info.balance || 0;
-        if (CETH_ASSET_KEYS.includes(tok)) ceth = info.balance || 0;
+        if (tok === 'Amulet' || tok === 'CC (Amulet)' || tok === 'CC') cc = info.balance || 0;
+        if (tok === 'USDCx' || tok === 'USDCX') usdcx = info.balance || 0;
+        if (tok === 'CETH' || tok === 'cETH' || tok === 'Ceth') ceth = info.balance || 0;
     }
 
     let monthReward = 0, monthVolume = 0, monthTxns = 0;
@@ -1396,8 +1204,8 @@ async function refreshAccountData(ctx) {
     if (currentAccount.initialTxns === null) {
         // First time - set initial values
         dashboard.update(index, { initialTxns: monthTxns, initialReward: monthReward });
-    } else if (monthReward > 0) {
-        // Calculate diff from initial (only when API returned valid data)
+    } else {
+        // Calculate diff from initial
         diffTxns = monthTxns - currentAccount.initialTxns;
         diffReward = monthReward - currentAccount.initialReward;
     }
@@ -1422,27 +1230,28 @@ function startBackgroundRefresh(ctx) {
     const intervalSec = bgConfig.interval_seconds || 60;
 
     if (!enabled) {
-        log(' Background refresh disabled');
+        log('📊 Background refresh disabled');
         return null;
     }
 
-    log(` BG refresh (${intervalSec}s)`);
+    const intervalMin = (intervalSec / 60).toFixed(0);
+    log(`📊 Auto-refresh dashboard tiap ${intervalMin}m`);
 
     const intervalId = setInterval(async () => {
         try {
             // Ensure tokens are fresh before refresh
-            await session.ensureFreshTokens(walletApi, swapApi, () => { });
+            await session.ensureFreshTokens(walletApi, swapApi, log);
 
             // Refresh balance
             const { holdings = {} } = await session.withRetry(
-                () => walletApi.getBalance(session.walletToken), 'wallet', walletApi, swapApi, () => { }
+                () => walletApi.getBalance(session.walletToken), 'wallet', walletApi, swapApi, log
             );
 
             let cc = 0, usdcx = 0, ceth = 0;
             for (const [tok, info] of Object.entries(holdings)) {
-                if (CC_ASSET_KEYS.includes(tok)) cc = info.balance || 0;
-                if (USDCX_ASSET_KEYS.includes(tok)) usdcx = info.balance || 0;
-                if (CETH_ASSET_KEYS.includes(tok)) ceth = info.balance || 0;
+                if (tok === 'Amulet' || tok === 'CC (Amulet)' || tok === 'CC') cc = info.balance || 0;
+                if (tok === 'USDCx' || tok === 'USDCX') usdcx = info.balance || 0;
+                if (tok === 'CETH' || tok === 'cETH' || tok === 'Ceth') ceth = info.balance || 0;
             }
 
             // Refresh reward/leaderboard data
@@ -1466,7 +1275,7 @@ function startBackgroundRefresh(ctx) {
             let diffTxns = currentAccount.diffTxns || 0;
             let diffReward = currentAccount.diffReward || 0;
 
-            if (currentAccount.initialTxns !== null && monthReward > 0) {
+            if (currentAccount.initialTxns !== null) {
                 diffTxns = monthTxns - currentAccount.initialTxns;
                 diffReward = monthReward - currentAccount.initialReward;
             }
@@ -1479,8 +1288,11 @@ function startBackgroundRefresh(ctx) {
                 diffTxns, diffReward,
                 rewardDate: new Date().toISOString().slice(0, 10),
             });
-        } catch {
-            // Silent fail for background refresh
+
+            const diffStr = diffReward >= 0 ? `+${diffReward.toFixed(2)}` : diffReward.toFixed(2);
+            log(`🔄 Refresh: CC ${cc.toFixed(2)} | USDCx ${usdcx.toFixed(4)} | cETH ${ceth.toFixed(6)} | Δrew ${diffStr}CC`);
+        } catch (err) {
+            log(`⚠️ Auto-refresh gagal: ${formatError(err)}`);
         }
     }, intervalSec * 1000);
 
@@ -1496,27 +1308,64 @@ function stopBackgroundRefresh(intervalId) {
 // ── Wait for Account Setup (422 handling) ────────────────────────────────
 
 async function waitForAccountSetup(swapApi, swapToken, partyId, log) {
-    for (let i = 1; i <= SETUP_WAIT_MAX; i++) {
-        log(` Setup pending (${i}), wait 30s...`);
-        await sleep(30);
-        try {
-            // Only test with getQuote - don't create orders during setup
-            const pb = getActivePairB();
-            const minAmt = config.swap.min_amount || 27;
-            const q = await swapApi.getQuote('CC', '0x0', pb.chain, pb.asset, minAmt);
-            if (q && q.quoteId) {
-                log(' Account setup complete (quote OK)');
-                return true;
+    // ── Pre-check: pastikan tidak ada active order tertinggal ──
+    // "Account setup not complete" sering dipicu oleh active order CETH/USDCX
+    // yang masih AWAITING_DEPOSIT dari sesi sebelumnya — server tolak order
+    // baru selama order lama belum CANCELLED. Web manual lakukan cancel dulu.
+    try {
+        const active = await swapApi.getActiveOrder(swapToken, {});
+        if (active?.orderId) {
+            const TERMINAL = ['COMPLETED', 'CANCELLED', 'REFUNDED', 'FAILED'];
+            if (!TERMINAL.includes(active.status)) {
+                log(`🚫 Active order ${shortId(active.orderId)} (${active.status}) — cancel dulu`);
+                try {
+                    await swapApi.cancelOrder(swapToken, active.orderId);
+                    log(`✅ Cancelled ${shortId(active.orderId)}`);
+                } catch (cancelErr) {
+                    // Cancel gagal? poll status sampai TERMINAL
+                    log(`⚠️ Cancel gagal, poll status...`);
+                    for (let p = 0; p < 30; p++) {
+                        await sleep(5);
+                        try {
+                            const check = await swapApi.getOrderStatus(swapToken, active.orderId);
+                            if (TERMINAL.includes(check.status)) {
+                                log(`✅ Order ${shortId(active.orderId)} → ${check.status}`);
+                                break;
+                            }
+                        } catch { break; }
+                    }
+                }
             }
+        }
+    } catch { /* tidak ada active order, lanjut */ }
+
+    for (let i = 1; i <= SETUP_WAIT_MAX; i++) {
+        log(`⏳ Setup pending (${i}), wait ${SETUP_WAIT_SEC}s...`);
+        await sleep(SETUP_WAIT_SEC);
+        try {
+            // Test with a dummy quote + order to see if setup is done
+            const q = await swapApi.getQuote('CC', '0x0', 'CC', 'USDCX', 1);
+            const testId = generateOrderId();
+            await swapApi.createOrder(swapToken, testId, q.quoteId, partyId);
+            // Success — cancel the test order and return
+            try { await swapApi.cancelOrder(swapToken, testId); } catch { /* ignore */ }
+            log('✅ Account setup complete');
+            return true;
         } catch (err) {
-            const status = err.response?.status;
-            const detail = String(err.response?.data?.detail || err.response?.data?.message || '');
-            if (status === 422 && detail.includes('Account setup not complete')) {
-                log(` Still setting up... (attempt ${i})`);
+            const detail = String(err.response?.data?.detail || '');
+            // Kalau test order gagal karena active order lain (409) → cancel & retry
+            if (err.response?.status === 409) {
+                try {
+                    const active = await swapApi.getActiveOrder(swapToken, {});
+                    if (active?.orderId) {
+                        log(`🚫 Active order muncul lagi: ${shortId(active.orderId)}, cancel`);
+                        try { await swapApi.cancelOrder(swapToken, active.orderId); } catch { /* ignore */ }
+                    }
+                } catch { /* ignore */ }
                 continue;
             }
-            // Different error = setup might be done
-            log(` Setup check got: [${status}] ${detail.slice(0, 80)}`);
+            if (detail.includes('Account setup not complete') || err.response?.status === 422) continue;
+            // Different error = setup might be done, or other issue
             return true;
         }
     }
@@ -1530,63 +1379,78 @@ function getInstrumentAdminId(holdings, assetKey) {
     const nameMap = {
         '0x0': ['Amulet', 'CC (Amulet)', 'CC'],
         'USDCX': ['USDCx', 'USDCX'],
-        'CETH': ['cETH', 'CETH'],
+        'CETH': ['cETH', 'CETH', 'Ceth'],
     };
     const names = nameMap[assetKey] || [assetKey];
     for (const n of names) {
         if (holdings?.[n]?.instrument_admin_id) return holdings[n].instrument_admin_id;
     }
-    // Fallback for CETH if not found in holdings
-    if (assetKey === 'CETH') return CETH_INST_ADMIN;
     return '';
+}
+
+function getBalanceFor(holdings, assetKey) {
+    const nameMap = {
+        '0x0': ['Amulet', 'CC (Amulet)', 'CC'],
+        'USDCX': ['USDCx', 'USDCX'],
+        'CETH': ['cETH', 'CETH', 'Ceth'],
+    };
+    const names = nameMap[assetKey] || [assetKey];
+    for (const n of names) {
+        if (holdings?.[n]?.balance != null) return holdings[n].balance;
+    }
+    return 0;
 }
 
 // ── Perform Swap ─────────────────────────────────────────────────────────
 
 async function performSwap(ctx, holdings) {
-    const { session, walletApi, swapApi, log, name, index } = ctx;
-    const { rounds, delay_min_seconds, delay_max_seconds, min_amount, pair_a } = config.swap;
-    const pair_b = getActivePairB();
+    const { session, walletApi, swapApi, log, index } = ctx;
+    const { rounds, delay_min_seconds, delay_max_seconds, min_amount, pair_a, pair_b } = config.swap;
+    let pair_c = config.swap.pair_c;
+
+    const isSetupNotComplete = (result) => {
+        if (!result || !result.error) return false;
+        const msg = String(result.message || '').toLowerCase();
+        return msg.includes('account setup not complete');
+    };
 
     dashboard.update(index, { status: 'checking', maxCCtoU: rounds });
 
-    log(' Checking exchange status...');
+    log('🌐 Checking exchange status...');
     const exchangeOk = await swapApi.checkExchange();
     if (!exchangeOk) {
-        log(' Exchange offline → soft restart 30s');
+        log('❌ Exchange offline → soft restart 30s');
         dashboard.update(index, { status: 'offline', swap: false });
         const offlineErr = new Error('EXCHANGE_OFFLINE');
-        offlineErr.response = { status: 500 }; // trigger soft restart
+        offlineErr.response = { status: 500 };
         throw offlineErr;
     }
 
-    // ── Dynamic Minimum Swap: Initial fetch ──
     if (dynamicMinSwap.enabled) {
-        log(' Fetching minimum swap from API...');
+        log('🔍 Fetching minimum swap from API...');
         const initialAmount = await fetchDynamicMinSwap(swapApi, log);
-        log(` Initial swap amount: ${initialAmount.toFixed(2)}CC (raw: ${dynamicMinSwap.lastRawMin})`);
+        log(`📊 Initial swap amount: ${initialAmount.toFixed(2)}CC`);
     }
 
-    // Get effective swap amount (dynamic or static) - will be fetched fresh before each swap
     const getMinThreshold = () => dynamicMinSwap.enabled
         ? (dynamicMinSwap.lastRawMin + dynamicMinSwap.extraCc)
         : min_amount;
 
-    let ccBalance = getHoldingBal(holdings, CC_ASSET_KEYS);
-    let usdcxBalance = getHoldingBal(holdings, getPairBAssetKeys());
-    let holdingsCache = holdings || {}; // cache for instrument_admin_id lookups
+    let holdingsCache = holdings || {};
+    let ccBalance = getBalanceFor(holdingsCache, pair_a.asset);
+    let usdcxBalance = getBalanceFor(holdingsCache, pair_b.asset);
+    let cethBalance = pair_c ? getBalanceFor(holdingsCache, pair_c.asset) : 0;
     const rewardThreshold = config.swap.reward_landed_threshold ?? 100;
 
-    // Check if reward landed (CC > threshold) → stop swapping
     if (ccBalance >= rewardThreshold) {
-        log(` Reward landed! CC(${ccBalance.toFixed(2)}) >= ${rewardThreshold} → pausing`);
+        log(`🎉 Reward landed! CC(${ccBalance.toFixed(2)}) >= ${rewardThreshold} → pausing`);
         dashboard.update(index, { status: 'reward-landed', swap: false });
         return;
     }
 
-    // Auth swap API
+    // ── Auth swap API ──
     dashboard.update(index, { status: 'swap-auth' });
-    log(' Authenticating swap API...');
+    log('🔐 Authenticating swap API...');
     await retryOnNetwork(async () => {
         const { nonce } = await swapApi.getNonce();
         const swapAuth = await swapApi.bindSignature(nonce, session.partyId);
@@ -1594,523 +1458,297 @@ async function performSwap(ctx, holdings) {
         session.swapLoginTime = Date.now();
     }, { maxRetries: 8, baseDelay: 5, label: 'swapAuth', log });
     dashboard.update(index, { swap: true });
-    log(' Swap API ready');
+    log('✅ Swap API ready');
 
-    // Check eligibility (retry infinitely until eligible)
+    // ── Eligibility check ──
     for (let eligAttempt = 1; ; eligAttempt++) {
         try {
             const eligibility = await swapApi.checkEligibility(session.partyId);
-            if (eligibility.eligible) {
-                log(' Eligible for swap');
-                break;
-            }
-            log(` Not eligible, retry 30s (#${eligAttempt})`);
+            if (eligibility.eligible) { log('✅ Eligible'); break; }
+            log(`⏳ Not eligible, retry 30s (#${eligAttempt})`);
             dashboard.update(index, { status: `ineligible #${eligAttempt}` });
             await sleep(30);
             await session.ensureFreshTokens(walletApi, swapApi, log);
-        } catch {
-            // API error = non-critical, assume eligible and continue
-            break;
-        }
+        } catch { break; }
     }
 
-    // ── Recovery: check for in-flight orders from previous session ──
-    log(' Checking for unfinished orders...');
-    let hadActiveOrderAtStart = false; // Track if there was an active order at start
+    // ── Recovery: cancel AWAITING_DEPOSIT order dari sesi sebelumnya ──
+    log('🔍 Checking unfinished orders...');
     try {
         const activeOrder = await swapApi.getActiveOrder(session.swapToken, {});
         if (activeOrder?.orderId) {
             const TERMINAL = ['COMPLETED', 'CANCELLED', 'REFUNDED', 'FAILED'];
             if (!TERMINAL.includes(activeOrder.status)) {
-                hadActiveOrderAtStart = true; // Mark that we had active order
-                log(` Resume ${shortId(activeOrder.orderId)} (${activeOrder.status})`);
-                dashboard.update(index, { status: `resuming ${activeOrder.status}` });
-
-                const maxResumePoll = Infinity;
-                let resumeCount = 0;
-                let lastResumeStatus = activeOrder.status;
-                while (resumeCount < maxResumePoll) {
-                    await sleep(5);
-                    resumeCount++;
-                    if (resumeCount % 12 === 0) await session.ensureFreshTokens(walletApi, swapApi, log);
-                    try {
-                        const check = await swapApi.getOrderStatus(session.swapToken, activeOrder.orderId);
-                        if (check.status !== lastResumeStatus) {
-                            log(` Order: ${lastResumeStatus} → ${check.status}`);
-                            lastResumeStatus = check.status;
-                        }
-                        if (TERMINAL.includes(check.status)) {
-                            log(` Order ${shortId(activeOrder.orderId)} → ${check.status}`);
-                            break;
-                        }
-                    } catch (pollErr) {
-                        if (pollErr.response?.status === 401) {
-                            await session.refreshSwapToken(swapApi, log);
-                            continue;
-                        }
-                        log(` Order resolved`);
-                        break;
+                if (activeOrder.status === 'AWAITING_DEPOSIT') {
+                    log(`🚫 Stale ${shortId(activeOrder.orderId)} (AWAITING_DEPOSIT) → cancel`);
+                    try { await swapApi.cancelOrder(session.swapToken, activeOrder.orderId); } catch { /* ignore */ }
+                } else {
+                    log(`🔄 Resume ${shortId(activeOrder.orderId)} (${activeOrder.status})`);
+                    dashboard.update(index, { status: `resuming` });
+                    let lastStatus = activeOrder.status;
+                    while (true) {
+                        await sleep(5);
+                        try {
+                            const check = await swapApi.getOrderStatus(session.swapToken, activeOrder.orderId);
+                            if (check.status !== lastStatus) {
+                                log(`⏳ ${lastStatus} → ${check.status}`);
+                                lastStatus = check.status;
+                            }
+                            if (TERMINAL.includes(check.status)) break;
+                        } catch { break; }
                     }
                 }
-            } else {
-                log(` Previous order already ${activeOrder.status}`);
             }
         } else {
-            log(' No unfinished orders');
+            log('✅ No unfinished orders');
         }
-    } catch {
-        log(' No active orders found');
-    }
+    } catch { log('✅ No active orders'); }
 
-    log(' Checking pending offers...');
+    log('📩 Checking pending offers...');
     await acceptPendingOffers(ctx);
 
-    log(' Refreshing balances...');
-    try {
-        const { holdings: h } = await session.withRetry(
-            () => walletApi.getBalance(session.walletToken), 'wallet', walletApi, swapApi, log
-        );
-        ccBalance = getHoldingBal(h, CC_ASSET_KEYS);
-        usdcxBalance = getHoldingBal(h, getPairBAssetKeys());
-        holdingsCache = h || holdingsCache;
-        dashboard.update(index, { cc: ccBalance, usdcx: usdcxBalance });
-        log(` CC:${ccBalance.toFixed(2)} ${getPairBLabel()}:${usdcxBalance.toFixed(getPairBDecimals())}`);
-    } catch { /* use original */ }
-
-    // ── Legacy Bulk-Back Loop Removed ──
-    const ccReserve = config.swap.cc_reserve ?? 0.1;
-    const initialSwapAmount = getMinThreshold();
-    log(` ${rounds} siklus (swap_amount:${initialSwapAmount.toFixed(2)}CC${dynamicMinSwap.enabled ? ' [dynamic]' : ''})`);
-    let totalSwaps = 0;
-
-    // ══════════════════════════════════════════════════════════════
-    // ── TRIANGULAR SWAP CYCLE ENGINE (3 TX/hour)                ──
-    // ══════════════════════════════════════════════════════════════
-    // Mode B: No pre-emptive cooldown, 429-driven timing
-    //   Step 1: CC   → USDCx          (langsung)
-    //   Step 2: USDCx → CETH          (langsung)
-    //   Step 3: CETH → CC             (kena 429 → tunggu 28m → retry)
-    //    Smart cooldown: sisa waktu untuk genap 1 jam dari start siklus
-    // Total: ~60 min per cycle, 3 TX/hour = max allowed
-    // ══════════════════════════════════════════════════════════════
-
-    const pair_usdcx = config.swap.pair_b;
-    const pair_ceth = config.swap.pair_ceth;
-    const rateLimitWaitSec = config.swap.rate_limit_wait_seconds ?? 1860; // 31 minutes default
-
-    // Helper: fetch pending rebates from leaderboard API
-    async function fetchPendingRebates() {
+    // ── Refresh balance setelah recovery ──
+    const refreshBalances = async () => {
         try {
-            await session.ensureFreshTokens(walletApi, swapApi, log);
-            const lb = await swapApi.getLeaderboard(session.partyId);
-            const me = lb.requestedAddress || null;
-            if (me) return parseFloat(me.rewardAccruedCc ?? 0);
-        } catch { /* skip */ }
-        return 0;
-    }
+            const { holdings: h } = await session.withRetry(
+                () => walletApi.getBalance(session.walletToken), 'wallet', walletApi, swapApi, log
+            );
+            holdingsCache = h || holdingsCache;
+            ccBalance = getBalanceFor(holdingsCache, pair_a.asset);
+            usdcxBalance = getBalanceFor(holdingsCache, pair_b.asset);
+            cethBalance = pair_c ? getBalanceFor(holdingsCache, pair_c.asset) : 0;
+            dashboard.update(index, { cc: ccBalance, usdcx: usdcxBalance, ceth: cethBalance });
+        } catch { /* keep cached */ }
+    };
 
-    // Helper: execute one swap step
-    async function doSwapStep(stepNum, fromPair, toPair, amount) {
-        const decimals = fromPair.asset === 'CETH' ? 10 : 4;
-        log(`\n Step ${stepNum}: ${amount.toFixed(decimals)} ${fromPair.label} → ${toPair.label}`);
-        dashboard.update(index, { status: `S${stepNum} ${fromPair.label}→${toPair.label}` });
+    await refreshBalances();
+    log(`💰 CC:${ccBalance.toFixed(2)} USDCx:${usdcxBalance.toFixed(4)} cETH:${cethBalance.toFixed(6)}`);
 
-        await session.ensureFreshTokens(walletApi, swapApi, log);
-        await resolveActiveOrder(ctx);
-
+    // ── Helper: jalankan single leg (dengan validasi & deteksi setup) ──
+    const doLeg = async (fromPair, toPair, amount, label, opts = {}) => {
+        log(`═══ ${label} (${parseFloat(amount).toFixed(toPair.asset === 'CETH' ? 6 : 4)} ${fromPair.label})`);
         const result = await executeSwap(ctx, {
             fromChain: fromPair.chain, fromAsset: fromPair.asset,
             toChain: toPair.chain, toAsset: toPair.asset,
             amount, fromLabel: fromPair.label, toLabel: toPair.label,
             instrumentAdminId: getInstrumentAdminId(holdingsCache, fromPair.asset),
-        }, { pollTimeoutMinutes: 15 });
+        }, opts);
 
-        if (!result || result.error) {
-            log(` Step ${stepNum} failed: ${result?.message || 'unknown'}`);
-            return null;
+        if (result && !result.error) {
+            log(`✅ ${label}: +${result.receiveAmount || '?'} ${toPair.label}`);
+            return result;
+        }
+        if (isSetupNotComplete(result)) {
+            log(`🚫 ${toPair.label} belum setup — disable pair_c`);
+            log(`💡 Lakukan 1x swap CETH manual via web untuk aktivasi`);
+            pair_c = null;
+        }
+        log(`⚠️ ${label} gagal`);
+        return null;
+    };
+
+    // ── Posisi state: tentukan langkah pertama ──
+    // Alur: CC → USDCx → CETH → CC
+    // Kalau ada saldo CETH → lanjut dari CETH→CC dulu
+    // Kalau ada saldo USDCx → lanjut dari USDCx→CETH dulu
+    // Kalau cuma CC → mulai CC→USDCx
+    let totalSwaps = 0;
+    let consecutiveFails = 0;
+
+    log(`⚡ ${rounds} rounds (alur CC→USDCx→CETH→CC, no bulk-back)`);
+
+    for (let round = 1; round <= rounds; round++) {
+        await session.ensureFreshTokens(walletApi, swapApi, log);
+        try { await acceptPendingOffers(ctx); } catch { /* ignore */ }
+        await refreshBalances();
+
+        if (ccBalance >= rewardThreshold) {
+            log(`🎉 Reward landed mid-loop! CC(${ccBalance.toFixed(2)})`);
+            dashboard.update(index, { status: 'reward-landed', swap: false, totalSwaps });
+            return;
         }
 
-        await sleep(5);
-        try { await acceptPendingOffers(ctx); } catch { /* ignore */ }
-        await sleep(3);
-        try { await acceptPendingOffers(ctx); } catch { /* ignore */ }
-
-        try {
-            const refreshed = await refreshAccountData(ctx);
-            holdingsCache = refreshed || holdingsCache;
-            ccBalance = getHoldingBal(refreshed, CC_ASSET_KEYS);
-        } catch { /* use cached */ }
-
-        const uBal = getHoldingBal(holdingsCache, USDCX_ASSET_KEYS);
-        const cBal = getHoldingBal(holdingsCache, CETH_ASSET_KEYS);
-        dashboard.update(index, { cc: ccBalance, usdcx: uBal, ceth: cBal, totalSwaps: totalSwaps + 1 });
-        totalSwaps++;
-
-        const recvDec = toPair.asset === 'CETH' ? 10 : 4;
-        log(` Step ${stepNum} OK: +${parseFloat(result.receiveAmount || 0).toFixed(recvDec)} ${toPair.label} | CC:${ccBalance.toFixed(2)} USDCx:${uBal.toFixed(4)} CETH:${cBal.toFixed(10)}`);
-        await sendSwapNotification(ctx, `S${stepNum}`, amount, result);
-
-        return { result, ccBalance, usdcxBal: uBal, cethBal: cBal };
-    }
-
-    // Helper: do the 31-minute cooldown wait with countdown in dashboard
-    async function doCooldownWait(reason) {
-        const waitSec = rateLimitWaitSec;
-        const waitMin = Math.round(waitSec / 60);
-        log(`\n ${reason}: menunggu ${waitMin} menit...`);
-        dashboard.update(index, { status: `cooldown ${waitMin}m` });
-        await sleep(waitSec);
-        log(` Cooldown selesai, lanjut swap...`);
-    }
-
-    // ══════════════════════════════════════════════════════
-    // ── MULTI-MODE SWAP ENGINE (Mode 1-4)               ──
-    // ══════════════════════════════════════════════════════
-
-    const cooldownBetweenBatches = config.swap.cooldown_seconds ?? 1320;
-
-    if (swapMode === 1 || swapMode === 2) {
-        // ════════════════════════════════════════════════════
-        // PING-PONG ENGINE (Mode 1: CCUSDCx, Mode 2: CCCETH)
-        //
-        // tx_per_cycle  → jumlah TX per window (dari config)
-        // cooldown / TX → rate_limit_wait_seconds ÷ tx_per_cycle
-        //
-        // Contoh config:
-        //   tx_per_cycle: 2, rate_limit_wait_seconds: 3600
-        //   → 2 TX/jam, jeda 30 menit per TX
-        //   → TX1: CC→USDCx  30m  TX2: USDCx→CC  30m  (next window)
-        //
-        //   tx_per_cycle: 3, rate_limit_wait_seconds: 3600
-        //   → 3 TX/jam, jeda 20 menit per TX
-        //   → TX1 20m  TX2 20m  TX3 20m  (next window)
-        // ════════════════════════════════════════════════════
-        const ppPairB = swapMode === 1 ? pair_usdcx : pair_ceth;
-        const ppAssetKeys = swapMode === 1 ? USDCX_ASSET_KEYS : CETH_ASSET_KEYS;
-        const ppMinBal = swapMode === 1 ? 1 : 0.0005;
-        const ppLabel = swapMode === 1 ? 'USDCx' : 'CETH';
-        const ppDecimals = swapMode === 1 ? 4 : 10;
-        activePairMode = swapMode === 1 ? 'USDCX' : 'CETH';
-
-        // ── Baca tx_per_cycle dari config (default 2) ──
-        const txPerCycle = config.swap.tx_per_cycle ?? 2;
-        const ppCooldownSec = Math.floor(rateLimitWaitSec / txPerCycle);
-        const ppCooldownMin = Math.round(ppCooldownSec / 60);
-
-        log(` Mode ${swapMode} Ping-Pong: ${txPerCycle} TX/window | cooldown ${ppCooldownMin}m per TX`);
-
-        let ppWindow = 1;
-        while (ppWindow <= rounds) {
-            log('\n' + '═'.repeat(55));
-            log(` WINDOW #${ppWindow}/${rounds} [${ppLabel} Ping-Pong | ${txPerCycle}TX | ${ppCooldownMin}m/TX]`);
-            log('═'.repeat(55));
-
-            for (let txIdx = 0; txIdx < txPerCycle; txIdx++) {
-                await session.ensureFreshTokens(walletApi, swapApi, log);
-
-                try {
-                    const { holdings: h } = await session.withRetry(
-                        () => walletApi.getBalance(session.walletToken), 'wallet', walletApi, swapApi, log
-                    );
-                    ccBalance = getHoldingBal(h, CC_ASSET_KEYS);
-                    holdingsCache = h || holdingsCache;
-                } catch { /* cached */ }
-                try { await acceptPendingOffers(ctx); } catch { /* ignore */ }
-
-                const pairBBal = getHoldingBal(holdingsCache, ppAssetKeys);
+        // ── STEP A: Selesaikan CETH dulu kalau ada saldo (CETH → CC) ──
+        if (pair_c && cethBalance > 0) {
+            dashboard.update(index, { status: `${pair_c.label}→CC R${round}` });
+            const r = await doLeg(pair_c, pair_a, cethBalance, `R${round} ${pair_c.label}→CC`, { pollTimeoutMinutes: 10 });
+            if (r) {
+                totalSwaps++;
                 dashboard.update(index, {
-                    cc: ccBalance,
-                    usdcx: getHoldingBal(holdingsCache, USDCX_ASSET_KEYS),
-                    ceth: getHoldingBal(holdingsCache, CETH_ASSET_KEYS),
+                    totalSwaps, lastSwapDir: '↩CC',
+                    swapsUtCC: (dashboard.accounts[index].swapsUtCC || 0) + 1,
+                    swapsCETHtoCC: (dashboard.accounts[index].swapsCETHtoCC || 0) + 1,
                 });
+                consecutiveFails = 0;
+                await refreshBalances();
+            } else {
+                consecutiveFails++;
+                await sleep(Math.min(15 * consecutiveFails, 120));
+                round--; continue;
+            }
+        }
 
-                if (ccBalance >= rewardThreshold) {
-                    log(' Reward landed! CC(' + ccBalance.toFixed(2) + ') >= ' + rewardThreshold);
-                    dashboard.update(index, { status: 'reward-landed', swap: false });
-                    return;
-                }
+        // ── STEP B: Selesaikan USDCx kalau ada saldo (USDCx → CETH) ──
+        if (pair_c && usdcxBalance >= 0.0001) {
+            dashboard.update(index, { status: `U→${pair_c.label} R${round}` });
+            const r = await doLeg(pair_b, pair_c, usdcxBalance, `R${round} U→${pair_c.label}`, { pollTimeoutMinutes: 10 });
+            if (r) {
+                totalSwaps++;
+                dashboard.update(index, {
+                    totalSwaps, lastSwapDir: `→${pair_c.label}`,
+                    swapsUtoCETH: (dashboard.accounts[index].swapsUtoCETH || 0) + 1,
+                });
+                consecutiveFails = 0;
+                await refreshBalances();
+                // Lanjut ke STEP A di iterasi berikutnya untuk swap CETH→CC
+                round--; continue;
+            } else {
+                consecutiveFails++;
+                await sleep(Math.min(15 * consecutiveFails, 120));
+                round--; continue;
+            }
+        }
 
-                log(`\n TX ${txIdx + 1}/${txPerCycle} | CC: ${ccBalance.toFixed(4)} | ${ppLabel}: ${pairBBal.toFixed(ppDecimals)}`);
-
-                let stepFailed = false;
-                const stepLabel = `${ppWindow}-${txIdx + 1}`;
-
-                if (pairBBal >= ppMinBal) {
-                    // Punya pair B → swap B→CC
-                    log(` ${ppLabel}(${pairBBal.toFixed(ppDecimals)}) → CC`);
-                    const s = await doSwapStep(stepLabel, ppPairB, pair_a, pairBBal);
-                    if (!s) { stepFailed = true; }
-                    else { ccBalance = s.ccBalance; }
+        // ── STEP C: Mulai dari CC → USDCx (kalau CETH disabled, langsung CC→USDCx→CC tidak applicable; kalau pair_c null skip) ──
+        if (!pair_c) {
+            // CETH disabled untuk akun ini → fallback ke CC↔USDCx
+            // Tetap tanpa bulk-back paksa: kalau punya USDCx, swap balik ke CC
+            if (usdcxBalance >= 0.0001) {
+                dashboard.update(index, { status: `U→CC R${round}` });
+                const r = await doLeg(pair_b, pair_a, usdcxBalance, `R${round} U→CC`, { pollTimeoutMinutes: 10 });
+                if (r) {
+                    totalSwaps++;
+                    dashboard.update(index, {
+                        totalSwaps, lastSwapDir: '↩CC',
+                        swapsUtCC: (dashboard.accounts[index].swapsUtCC || 0) + 1,
+                    });
+                    await refreshBalances();
+                    consecutiveFails = 0;
                 } else {
-                    // Punya CC → swap CC→B
-                    const swapAmt = await fetchDynamicMinSwap(swapApi, log);
-                    if (ccBalance < swapAmt) {
-                        log(` CC(${ccBalance.toFixed(2)}) < min(${swapAmt.toFixed(2)}), skip TX`);
-                        stepFailed = true;
-                    } else {
-                        log(` CC(${ccBalance.toFixed(4)}) → ${ppLabel}`);
-                        const s = await doSwapStep(stepLabel, pair_a, ppPairB, swapAmt);
-                        if (!s) { stepFailed = true; }
-                        else { ccBalance = s.ccBalance; }
+                    consecutiveFails++;
+                    await sleep(Math.min(15 * consecutiveFails, 120));
+                    round--; continue;
+                }
+            }
+        }
+
+        // Sekarang state: cethBalance==0, usdcxBalance==0 → mulai CC→USDCx
+        if (ccBalance < getMinThreshold()) {
+            dashboard.update(index, { status: `wait CC ${ccBalance.toFixed(1)}` });
+            log(`⏳ CC(${ccBalance.toFixed(2)}) < min(${getMinThreshold().toFixed(2)}), waiting...`);
+            // Polling balance + offers (60s)
+            for (let wp = 0; wp < 6; wp++) {
+                await sleep(10);
+                await session.ensureFreshTokens(walletApi, swapApi, log);
+                try { await acceptPendingOffers(ctx); } catch { /* ignore */ }
+                await refreshBalances();
+                if (ccBalance >= getMinThreshold()) break;
+            }
+            if (ccBalance < getMinThreshold()) { round--; continue; }
+        }
+
+        // ── STEP D: CC → USDCx (leg utama) ──
+        const swapAmount = await fetchDynamicMinSwap(swapApi, log);
+        if (ccBalance < swapAmount) {
+            log(`⏳ CC(${ccBalance.toFixed(2)}) < swap(${swapAmount.toFixed(2)}), waiting...`);
+            await sleep(30);
+            round--; continue;
+        }
+
+        dashboard.update(index, {
+            status: `CC→U R${round}/${rounds}`,
+            swapsCCtoU: (dashboard.accounts[index].swapsCCtoU || 0) + 1,
+        });
+        const r = await doLeg(pair_a, pair_b, swapAmount, `R${round}/${rounds} CC→U`);
+        if (r) {
+            totalSwaps++;
+            dashboard.update(index, { totalSwaps, lastSwapDir: '→' });
+            consecutiveFails = 0;
+            await refreshBalances();
+
+            // Refresh minimum dari API setelah swap sukses (detect kalau minimum turun)
+            if (dynamicMinSwap.enabled && round < rounds) {
+                try {
+                    const freshMin = await swapApi.getMinimumSwap(pair_a.chain, pair_a.asset, pair_b.chain, pair_b.asset);
+                    if (freshMin !== null && !isNaN(freshMin) && freshMin > 0 && freshMin !== dynamicMinSwap.lastRawMin) {
+                        log(`📊 Min refresh: ${dynamicMinSwap.lastRawMin}→${freshMin}CC`);
+                        dynamicMinSwap.lastRawMin = freshMin;
                     }
-                }
-
-                if (stepFailed) {
-                    log(` TX ${txIdx + 1}/${txPerCycle} gagal, tunggu 60s...`);
-                    dashboard.update(index, { status: `failed TX ${txIdx + 1}/${txPerCycle}` });
-                    await sleep(60);
-                    // lanjut TX berikutnya dalam window yang sama (tidak reset window)
-                    continue;
-                }
-
-                // ── Cooldown per TX (termasuk setelah TX terakhir) ──
-                // Cooldown setelah TX terakhir = jeda sebelum window berikutnya
-                log(`\n Cooldown TX ${txIdx + 1}/${txPerCycle}: ${ppCooldownMin} menit...`);
-                dashboard.update(index, { status: `cd ${ppCooldownMin}m (TX ${txIdx + 1}/${txPerCycle})` });
-                await sleep(ppCooldownSec);
-                log(` Cooldown selesai`);
+                } catch { /* silent */ }
             }
-
-            log(` Window #${ppWindow}/${rounds} selesai`);
-            ppWindow++;
+        } else {
+            // Roll-back counter swapsCCtoU karena gagal
+            dashboard.update(index, { swapsCCtoU: Math.max(0, (dashboard.accounts[index].swapsCCtoU || 1) - 1) });
+            consecutiveFails++;
+            await sleep(Math.min(10 * consecutiveFails, 120));
+            await resolveActiveOrder(ctx);
+            round--; continue;
         }
 
-    } else {
-        // ════════════════════════════════════════════════════
-        // TRIANGULAR ENGINE (Mode 3: 3TX, Mode 4: Configurable)
-        // Chain: CC → USDCx → CETH → CC → ... (circular)
-        // ════════════════════════════════════════════════════
-        const schedule = swapMode === 3
-            ? [2, 1]
-            : (config.swap.swaps_per_window_schedule || [2, 3]);
-        const totalTxPerCycle = schedule.reduce((a, b) => a + b, 0);
-
-        const CHAIN = [
-            { from: pair_a, to: pair_usdcx },
-            { from: pair_usdcx, to: pair_ceth },
-            { from: pair_ceth, to: pair_a },
-        ];
-
-        function detectChainPos(h) {
-            const cBal = getHoldingBal(h, CETH_ASSET_KEYS);
-            const uBal = getHoldingBal(h, USDCX_ASSET_KEYS);
-            if (cBal >= 0.0005) return 2;
-            if (uBal >= 1) return 1;
-            return 0;
-        }
-
-        async function getSwapAmtForPos(pos, h) {
-            const idx = pos % 3;
-            if (idx === 0) return await fetchDynamicMinSwap(swapApi, log);
-            if (idx === 1) return getHoldingBal(h, USDCX_ASSET_KEYS);
-            return getHoldingBal(h, CETH_ASSET_KEYS);
-        }
-
-        function getMinBalForPos(pos) {
-            const idx = pos % 3;
-            if (idx === 0) return 0;
-            if (idx === 1) return 1;
-            return 0.0005;
-        }
-
-        let cycle = 1;
-        let isRetry = false;
-        let rebatesBefore = 0;
-        let ccCycleStart = 0;
-        let cycleStartMs_saved = 0;
-
-        while (cycle <= rounds) {
-            await session.ensureFreshTokens(walletApi, swapApi, log);
-
-            try {
-                const { holdings: h } = await session.withRetry(
-                    () => walletApi.getBalance(session.walletToken), 'wallet', walletApi, swapApi, log
-                );
-                ccBalance = getHoldingBal(h, CC_ASSET_KEYS);
-                holdingsCache = h || holdingsCache;
-            } catch { /* cached */ }
-            try { await acceptPendingOffers(ctx); } catch { /* ignore */ }
-
-            let usdcxBal = getHoldingBal(holdingsCache, USDCX_ASSET_KEYS);
-            let cethBal = getHoldingBal(holdingsCache, CETH_ASSET_KEYS);
-            dashboard.update(index, { cc: ccBalance, usdcx: usdcxBal, ceth: cethBal });
-
-            if (ccBalance >= rewardThreshold) {
-                log(' Reward landed! CC(' + ccBalance.toFixed(2) + ') >= ' + rewardThreshold);
-                dashboard.update(index, { status: 'reward-landed', swap: false });
-                return;
-            }
-
-            if (!isRetry) rebatesBefore = await fetchPendingRebates();
-
-            log('\n' + '═'.repeat(55));
-            log(' SIKLUS #' + cycle + '/' + rounds + ' ' + (isRetry ? '(RETRY)' : '') + ' [' + totalTxPerCycle + 'TX: batch ' + schedule.join('+') + ']');
-            log('═'.repeat(55));
-            log(' CC: ' + ccBalance.toFixed(4) + ' | USDCx: ' + usdcxBal.toFixed(4) + ' | CETH: ' + cethBal.toFixed(10));
-            log(' Rebates Before: ' + rebatesBefore.toFixed(4) + ' CC');
-
-            let chainPos = detectChainPos(holdingsCache);
-            const posNames = ['CC→USDCx', 'USDCx→CETH', 'CETH→CC'];
-            log(' Start posisi ' + chainPos + ': ' + posNames[chainPos]);
-
-            if (!isRetry) {
-                ccCycleStart = ccBalance;
-                cycleStartMs_saved = Date.now();
-            }
-            let stepFailed = false;
-            let stepCounter = 0;
-
-            for (let batchIdx = 0; batchIdx < schedule.length && !stepFailed; batchIdx++) {
-                const batchSize = schedule[batchIdx];
-                log('\n Batch ' + (batchIdx + 1) + '/' + schedule.length + ' (' + batchSize + ' TX)');
-
-                for (let s = 0; s < batchSize && !stepFailed; s++) {
-                    stepCounter++;
-                    const step = CHAIN[chainPos % 3];
-
-                    // Refresh balance before each step
-                    try {
-                        const { holdings: h } = await session.withRetry(
-                            () => walletApi.getBalance(session.walletToken), 'wallet', walletApi, swapApi, log
-                        );
-                        ccBalance = getHoldingBal(h, CC_ASSET_KEYS);
-                        usdcxBal = getHoldingBal(h, USDCX_ASSET_KEYS);
-                        cethBal = getHoldingBal(h, CETH_ASSET_KEYS);
-                        holdingsCache = h || holdingsCache;
-                    } catch { /* cached */ }
-
-                    const swapAmount = await getSwapAmtForPos(chainPos, holdingsCache);
-                    const minBal = getMinBalForPos(chainPos);
-
-                    // Check minimum balance
-                    if (chainPos % 3 === 0) {
-                        if (ccBalance < swapAmount) {
-                            log(' CC(' + ccBalance.toFixed(2) + ') < min(' + swapAmount.toFixed(2) + '), skip');
-                            stepFailed = true;
-                            break;
-                        }
-                    } else {
-                        if (swapAmount < minBal) {
-                            const dec = chainPos % 3 === 2 ? 10 : 4;
-                            log(' ' + step.from.label + '(' + swapAmount.toFixed(dec) + ') < min, skip');
-                            stepFailed = true;
-                            break;
-                        }
-                    }
-
-                    const result = await doSwapStep(stepCounter, step.from, step.to, swapAmount);
-                    if (!result) {
-                        stepFailed = true;
-                        break;
-                    }
-
-                    ccBalance = result.ccBalance;
-                    usdcxBal = result.usdcxBal;
-                    cethBal = result.cethBal;
-                    chainPos++;
-                }
-
-                // Cooldown between batches (not after last batch)
-                if (!stepFailed && batchIdx < schedule.length - 1) {
-                    const cdMin = Math.round(cooldownBetweenBatches / 60);
-                    log('\n Cooldown antar batch: ' + cdMin + ' menit...');
-                    dashboard.update(index, { status: 'cooldown ' + cdMin + 'm' });
-                    await sleep(cooldownBetweenBatches);
-                    log(' Cooldown selesai');
-                }
-            }
-
-            // Handle step failure → retry same cycle
-            if (stepFailed) {
-                log(' Step gagal, tunggu 60s sebelum retry...');
-                dashboard.update(index, { status: 'failed retry cycle ' + cycle });
-                isRetry = true;
-                await sleep(60);
-                continue;
-            }
-
-            // ── P/L Calculation ──
-            let rebatesAfter = rebatesBefore;
-            for (let rp = 1; rp <= 5; rp++) {
-                const val = await fetchPendingRebates();
-                if (val > rebatesBefore) {
-                    rebatesAfter = val;
-                    log(' Rebates updated: ' + val.toFixed(4) + ' CC (poll ' + rp + ')');
-                    break;
-                }
-                if (rp < 5) {
-                    log(' Rebates belum update (' + rp + '/5), tunggu 30s...');
-                    await sleep(30);
-                }
-            }
-
-            const spreadLoss = ccCycleStart - ccBalance;
-            const rewardGain = rebatesAfter - rebatesBefore;
-            const netPL = rewardGain - spreadLoss;
-            const plIcon = netPL >= 0 ? '' : '';
-
-            log('\n SIKLUS #' + cycle + ' SELESAI');
-            log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-            log(' CC Awal       : ' + ccCycleStart.toFixed(4));
-            log(' CC Sisa       : ' + ccBalance.toFixed(4));
-            log(' Spread Loss   : -' + spreadLoss.toFixed(4) + ' CC');
-            log(' Rebates Before: ' + rebatesBefore.toFixed(4) + ' CC');
-            log(' Rebates After : ' + rebatesAfter.toFixed(4) + ' CC');
-            log(' Reward Gained : +' + rewardGain.toFixed(4) + ' CC');
-            log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-            log(plIcon + ' Net P/L: ' + (netPL >= 0 ? '+' : '') + netPL.toFixed(4) + ' CC (' + (netPL >= 0 ? 'UNTUNG' : 'RUGI') + ')');
-
-            await sendCycleNotification(ctx, cycle, rounds, {
-                ccCycleStart, ccCycleEnd: ccBalance, spreadLoss,
-                rebatesBefore, rebatesAfter, rewardGain, netPL,
-                stepFailed, totalSwaps,
-            });
-
-            isRetry = false;
-
-            // Smart cooldown: wait remaining time to fill 1 hour from cycle start
-            if (cycle < rounds) {
-                const cycleElapsedSec = Math.floor((Date.now() - cycleStartMs_saved) / 1000);
-                const targetCycleSec = rateLimitWaitSec; // 3600s = 60 min
-                const remainingSec = Math.max(60, targetCycleSec - cycleElapsedSec); // min 60s
-                const remainingMin = Math.round(remainingSec / 60);
-                const elapsedMin = Math.round(cycleElapsedSec / 60);
-                log('\n Siklus selesai dalam ' + elapsedMin + 'm, tunggu ' + remainingMin + 'm untuk genap ' + Math.round(targetCycleSec / 60) + 'm...');
-                dashboard.update(index, { status: 'cycle-wait ' + remainingMin + 'm' });
-                await sleep(remainingSec);
-                log(' Cooldown selesai, mulai siklus baru');
-            }
-            cycle++;
+        // Delay antar putaran
+        if (round < rounds && delay_min_seconds > 0) {
+            const randomDelay = getRandomDelay(delay_min_seconds, delay_max_seconds);
+            log(`⏳ Next round in ${formatDelayTime(randomDelay)}`);
+            await sleep(randomDelay);
         }
     }
 
-    // ── Final Cleanup ──
-    dashboard.update(index, { status: 'final cleanup' });
+    // ── Selesai semua round, pastikan CETH/USDCx sisa terkonversi balik ke CC ──
+    log('🏁 Final cleanup: pastikan saldo USDCx/CETH habis');
+    await refreshBalances();
     await session.ensureFreshTokens(walletApi, swapApi, log);
-    try {
-        const { holdings: h } = await session.withRetry(
-            () => walletApi.getBalance(session.walletToken), 'wallet', walletApi, swapApi, log
-        );
-        holdingsCache = h || holdingsCache;
-        const finalUsdcx = getHoldingBal(h, USDCX_ASSET_KEYS);
-        const finalCeth = getHoldingBal(h, CETH_ASSET_KEYS);
 
-        if (finalUsdcx >= 1) {
-            log(' Final: ' + finalUsdcx.toFixed(4) + ' USDCx → CC');
-            await doSwapStep('F1', pair_usdcx, pair_a, finalUsdcx);
+    if (pair_c && cethBalance > 0) {
+        const r = await doLeg(pair_c, pair_a, cethBalance, `Final ${pair_c.label}→CC`, { pollTimeoutMinutes: 10 });
+        if (r) {
+            totalSwaps++;
+            dashboard.update(index, {
+                totalSwaps,
+                swapsUtCC: (dashboard.accounts[index].swapsUtCC || 0) + 1,
+                swapsCETHtoCC: (dashboard.accounts[index].swapsCETHtoCC || 0) + 1,
+            });
+            await refreshBalances();
         }
-        if (finalCeth >= 0.0005) {
-            log(' Final: ' + finalCeth.toFixed(10) + ' CETH → CC');
-            await doSwapStep('F2', pair_ceth, pair_a, finalCeth);
+    }
+    if (pair_c && usdcxBalance >= 0.0001) {
+        // Lanjut ke CETH→CC dulu, lalu CETH→CC lagi
+        const r2 = await doLeg(pair_b, pair_c, usdcxBalance, `Final U→${pair_c.label}`, { pollTimeoutMinutes: 10 });
+        if (r2) {
+            totalSwaps++;
+            dashboard.update(index, {
+                totalSwaps,
+                swapsUtoCETH: (dashboard.accounts[index].swapsUtoCETH || 0) + 1,
+            });
+            await refreshBalances();
+            if (cethBalance > 0) {
+                const r3 = await doLeg(pair_c, pair_a, cethBalance, `Final ${pair_c.label}→CC`, { pollTimeoutMinutes: 10 });
+                if (r3) {
+                    totalSwaps++;
+                    dashboard.update(index, {
+                        totalSwaps,
+                        swapsUtCC: (dashboard.accounts[index].swapsUtCC || 0) + 1,
+                        swapsCETHtoCC: (dashboard.accounts[index].swapsCETHtoCC || 0) + 1,
+                    });
+                    await refreshBalances();
+                }
+            }
         }
-    } catch (err) {
-        log(' Final cleanup: ' + formatError(err));
+    } else if (!pair_c && usdcxBalance >= 0.0001) {
+        // pair_c disabled → langsung USDCx→CC sebagai cleanup
+        const r = await doLeg(pair_b, pair_a, usdcxBalance, `Final U→CC`, { pollTimeoutMinutes: 10 });
+        if (r) {
+            totalSwaps++;
+            dashboard.update(index, {
+                totalSwaps,
+                swapsUtCC: (dashboard.accounts[index].swapsUtCC || 0) + 1,
+            });
+            await refreshBalances();
+        }
     }
 
     await refreshAccountData(ctx);
-    log(' Done! ' + totalSwaps + ' swaps across ' + rounds + ' siklus');
+    log(`🏁 Done! ${totalSwaps} swaps`);
     dashboard.update(index, { status: 'done', totalSwaps });
-
 }
 
 // ── Accept Pending Offers ────────────────────────────────────────────────
@@ -2133,7 +1771,7 @@ async function acceptPendingOffers(ctx) {
 
     if (!offers.length) return;
 
-    log(` ${offers.length} offer(s)`);
+    log(`📩 ${offers.length} offer(s)`);
 
     for (const offer of offers) {
         const contractId = offer.contract_id || offer.contractId;
@@ -2152,7 +1790,7 @@ async function acceptPendingOffers(ctx) {
                     signatureB64: toBase64(signature),
                     hashingSchemeVersion: offer.hashing_scheme_version || 'HASHING_SCHEME_VERSION_V2',
                 }), 'wallet', walletApi, swapApi, log);
-                log(` Accept ${amount} ${instrumentId}`);
+                log(`✅ Accept ${amount} ${instrumentId}`);
             } else if (contractId) {
                 let rawPrepare = null;
                 for (const ep of ['/offer/accept/prepare', '/offers/accept/prepare', '/offers/accept']) {
@@ -2178,12 +1816,12 @@ async function acceptPendingOffers(ctx) {
                             signatureB64: toBase64(signature),
                             hashingSchemeVersion: rawPrepare.hashing_scheme_version || rawPrepare.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
                         }), 'wallet', walletApi, swapApi, log);
-                        log(` Accept ${amount} ${instrumentId}`);
+                        log(`✅ Accept ${amount} ${instrumentId}`);
                     }
                 }
             }
         } catch (err) {
-            log(` Offer: ${formatError(err)}`);
+            log(`❌ Offer: ${formatError(err)}`);
         }
     }
 }
@@ -2195,56 +1833,99 @@ async function executeSwap(ctx, { fromChain, fromAsset, toChain, toAsset, amount
     const { pollTimeoutMinutes } = opts;
 
     try {
-        log(` Quote ${parseFloat(amount).toFixed(2)} ${fromLabel}→${toLabel}...`);
+        log(`📋 Quote ${parseFloat(amount).toFixed(2)} ${fromLabel}→${toLabel}...`);
         const quote = await swapApi.getQuote(fromChain, fromAsset, toChain, toAsset, amount);
-        const _dec = (toAsset === 'CETH' || fromAsset === 'CETH') ? 10 : 4;
-        log(` ${parseFloat(quote.sendAmount).toFixed(2)}→${parseFloat(quote.receiveAmount).toFixed(_dec)} @${parseFloat(quote.rate).toFixed(_dec)}`);
+        log(`💱 ${parseFloat(quote.sendAmount).toFixed(2)}→${parseFloat(quote.receiveAmount).toFixed(4)} @${parseFloat(quote.rate).toFixed(4)}`);
 
         let orderId = generateOrderId();
-        log(` Order ${shortId(orderId)}`);
+        log(`📝 Order ${shortId(orderId)}`);
         let order;
-        try {
-            order = await session.withRetry(
-                () => swapApi.createOrder(session.swapToken, orderId, quote.quoteId, session.partyId), 'swap', walletApi, swapApi, log
-            );
-        } catch (createErr) {
-            const errStatus = createErr.response?.status;
-            const errDetail = String(createErr.response?.data?.detail || createErr.response?.data?.message || '');
 
-            // Handle 422 "Account setup not complete"
-            if (errStatus === 422 && errDetail.includes('Account setup not complete')) {
-                log(` Account setup not complete, retrying createOrder with delays...`);
-                let setupRetrySuccess = false;
-                for (let setupRetry = 1; setupRetry <= 10; setupRetry++) {
-                    log(` Setup retry ${setupRetry}/10, wait 30s...`);
-                    await sleep(30);
-                    try {
+        const refreshQuote = async () => {
+            const newQuote = await swapApi.getQuote(fromChain, fromAsset, toChain, toAsset, amount);
+            Object.assign(quote, newQuote);
+            return newQuote;
+        };
+
+        const createOrderWithRateLimitRefresh = async () => {
+            return await session.withRetry(
+                () => swapApi.createOrder(session.swapToken, orderId, quote.quoteId, session.partyId),
+                'swap',
+                walletApi,
+                swapApi,
+                log,
+                {
+                    onRateLimitRetry: async ({ attempt, delay }) => {
                         await session.ensureFreshTokens(walletApi, swapApi, log);
-                        const freshQuote = await swapApi.getQuote(fromChain, fromAsset, toChain, toAsset, amount);
-                        Object.assign(quote, freshQuote);
-                        const freshOrderId = generateOrderId();
-                        order = await swapApi.createOrder(session.swapToken, freshOrderId, freshQuote.quoteId, session.partyId);
-                        orderId = freshOrderId;
-                        log(` Order ${shortId(orderId)} (setup retry #${setupRetry})`);
-                        setupRetrySuccess = true;
-                        break;
-                    } catch (setupErr) {
-                        const setupMsg = String(setupErr.response?.data?.detail || setupErr.response?.data?.message || '');
-                        if (setupErr.response?.status === 422 && setupMsg.includes('Account setup not complete')) {
-                            log(` Still pending... (${setupRetry}/10)`);
-                            continue;
-                        }
-                        // Different error — re-throw to outer handler
-                        throw setupErr;
+                        await refreshQuote();
+                        orderId = generateOrderId();
+                        log(`♻️ Rate limit ${delay}s → fresh quote + order ${shortId(orderId)} (#${attempt})`);
                     }
                 }
-                if (!setupRetrySuccess) {
-                    // Exhausted 10 retries (~5 min) — soft restart this account
-                    log(` Setup still pending after 10 retries → soft restart`);
-                    const softErr = new Error('SETUP_TIMEOUT');
-                    softErr.response = { status: 500 };
-                    throw softErr;
+            );
+        };
+
+        try {
+            order = await createOrderWithRateLimitRefresh();
+        } catch (createErr) {
+            const errStatus = createErr.response?.status;
+            const errDetail = String(createErr.response?.data?.detail || '');
+            const errDetailLc = errDetail.toLowerCase();
+
+            // Handle 422 "Account setup not complete"
+            // Penyebab paling umum: ada active order tertinggal dari sesi sebelumnya
+            // (AWAITING_DEPOSIT) yang membuat server tolak order baru.
+            // Strategi: cek & cancel active order dulu (seperti web manual), lalu retry.
+            if (errStatus === 422 && errDetailLc.includes('account setup not complete')) {
+                log(`⚠️ [422] Account setup not complete → cek active order dulu`);
+                let activeFound = null;
+                try {
+                    const active = await swapApi.getActiveOrder(session.swapToken, {});
+                    const TERMINAL = ['COMPLETED', 'CANCELLED', 'REFUNDED', 'FAILED'];
+                    if (active?.orderId && !TERMINAL.includes(active.status)) {
+                        activeFound = active;
+                    }
+                } catch { /* 404 = no active order, fine */ }
+
+                if (activeFound) {
+                    log(`🚫 Active order ${shortId(activeFound.orderId)} (${activeFound.status}) → cancel`);
+                    try {
+                        await swapApi.cancelOrder(session.swapToken, activeFound.orderId);
+                        log(`✅ Cancelled ${shortId(activeFound.orderId)}`);
+                    } catch (cancelErr) {
+                        log(`⚠️ Cancel gagal: ${formatError(cancelErr)}, poll status`);
+                        const TERMINAL = ['COMPLETED', 'CANCELLED', 'REFUNDED', 'FAILED'];
+                        for (let p = 0; p < 30; p++) {
+                            await sleep(5);
+                            try {
+                                const check = await swapApi.getOrderStatus(session.swapToken, activeFound.orderId);
+                                if (TERMINAL.includes(check.status)) break;
+                            } catch { break; }
+                        }
+                    }
+                    await sleep(2);
+                    await acceptPendingOffers(ctx);
+                    await refreshQuote();
+                    orderId = generateOrderId();
+                    order = await createOrderWithRateLimitRefresh();
+                    log(`✅ Order ${shortId(orderId)} (setelah cancel active)`);
+                } else {
+                    // Tidak ada active order → benar-benar setup pending → tunggu
+                    const setupOk = await waitForAccountSetup(swapApi, session.swapToken, session.partyId, log);
+                    if (!setupOk) throw new Error('Account setup timed out');
+                    await refreshQuote();
+                    orderId = generateOrderId();
+                    order = await createOrderWithRateLimitRefresh();
                 }
+            }
+            // Handle 410 quote expired
+            else if (errStatus === 410 && errDetailLc.includes('quote') && errDetailLc.includes('expired')) {
+                log('♻️ Quote expired, requesting fresh quote...');
+                await session.ensureFreshTokens(walletApi, swapApi, log);
+                await refreshQuote();
+                orderId = generateOrderId();
+                log(`📝 Order ${shortId(orderId)} (quote refresh)`);
+                order = await createOrderWithRateLimitRefresh();
             }
             // Handle 409 conflict (active order exists)
             else if (errStatus === 409) {
@@ -2260,13 +1941,13 @@ async function executeSwap(ctx, { fromChain, fromAsset, toChain, toAsset, amount
                 }
                 if (!staleId) throw createErr;
 
-                log(` Active order ${shortId(staleId)}, resolving...`);
+                log(`⚠️ Active order ${shortId(staleId)}, resolving...`);
 
                 let cancelled = false;
                 try {
                     await swapApi.cancelOrder(session.swapToken, staleId);
                     cancelled = true;
-                    log(` Cancelled ${shortId(staleId)}`);
+                    log(`🚫 Cancelled ${shortId(staleId)}`);
                 } catch { /* wait */ }
 
                 if (!cancelled) {
@@ -2278,7 +1959,7 @@ async function executeSwap(ctx, { fromChain, fromAsset, toChain, toAsset, amount
                         if (pollN % 6 === 0) await session.ensureFreshTokens(walletApi, swapApi, log);
                         try {
                             const check = await swapApi.getOrderStatus(session.swapToken, staleId);
-                            log(` ${shortId(staleId)} → ${check.status}`);
+                            log(`🔄 ${shortId(staleId)} → ${check.status}`);
                             if (TERMINAL.includes(check.status)) break;
                         } catch (pollErr) {
                             if (pollErr.response?.status === 401) {
@@ -2292,94 +1973,62 @@ async function executeSwap(ctx, { fromChain, fromAsset, toChain, toAsset, amount
 
                 await acceptPendingOffers(ctx);
                 await sleep(2);
-                const newQuote = await swapApi.getQuote(fromChain, fromAsset, toChain, toAsset, amount);
-                Object.assign(quote, newQuote);
-                order = await swapApi.createOrder(session.swapToken, orderId, newQuote.quoteId, session.partyId);
+                await refreshQuote();
+                order = await createOrderWithRateLimitRefresh();
             }
-            // Handle generic 422 (not setup-related)
-            // ── Fast path: quote expired → fetch fresh quote IMMEDIATELY, no delay ──
-            // ── Slow path: escalating retry 15/30/60s for other 422 reasons        ──
-            else if (errStatus === 422 || errStatus === 410 || errStatus >= 500) {
+            // Handle generic 422 (not setup-related) → escalating retry with fresh quote + orderId
+            // Max 3 retries, then soft restart
+            else if (errStatus === 422) {
                 const errMsg = createErr.response?.data?.detail || createErr.response?.data?.message || 'Unknown';
-                const errMsgStr = typeof errMsg === 'object' ? JSON.stringify(errMsg) : String(errMsg);
-                log(` [${errStatus}] ${errMsgStr}`);
-
-                // Detect quote-expired / quote-invalid (no delay needed, just fetch new quote)
-                // 410 Gone = always quote expired
-                const isQuoteExpired = errStatus === 410
-                    || /quote.*(expired|invalid|not.?found|stale)/i.test(errMsgStr)
-                    || /expired.*quote/i.test(errMsgStr);
-
-                if (isQuoteExpired) {
-                    log(` Quote expired → fetch fresh quote immediately (step lanjut, tidak restart)...`);
+                log(`⚠️ [422] ${errMsg}`);
+                const rejectedDelays = config.retry?.server_rejected_delays || [15, 30, 60];
+                const max422Retries = config.retry?.max_422_retries ?? 3; // soft restart after this many
+                for (let rejAttempt = 0; rejAttempt < max422Retries; rejAttempt++) {
+                    const delay = getEscalatingDelay(rejAttempt, rejectedDelays);
+                    log(`⏳ [422] wait ${delay}s (#${rejAttempt + 1}/${max422Retries})`);
+                    await sleep(delay);
                     try {
                         await session.ensureFreshTokens(walletApi, swapApi, log);
-                        const freshQuote = await swapApi.getQuote(fromChain, fromAsset, toChain, toAsset, amount);
-                        Object.assign(quote, freshQuote);
-                        const freshOrderId = generateOrderId();
-                        order = await swapApi.createOrder(session.swapToken, freshOrderId, freshQuote.quoteId, session.partyId);
-                        orderId = freshOrderId;
-                        log(` Order ${shortId(orderId)} (fresh quote → lanjut step)`);
-                        // order berhasil dibuat → fall-through ke prepareTransfer, tidak restart
-                    } catch (freshErr) {
-                        // Fast path gagal → fall into escalating retry below
-                        log(` Fresh quote retry gagal: ${formatError(freshErr)}, escalating...`);
+                        await refreshQuote();
+                        orderId = generateOrderId(); // update for rest of flow
+                        order = await createOrderWithRateLimitRefresh();
+                        log(`✅ Order ${shortId(orderId)} (retry)`);
+                        break; // success
+                    } catch (retryErr) {
+                        if (retryErr.response?.status === 422) {
+                            const retryMsg = retryErr.response?.data?.detail || retryErr.response?.data?.message || retryErr.response?.data || 'Unknown';
+                            log(`⚠️ [422] ${typeof retryMsg === 'object' ? JSON.stringify(retryMsg) : retryMsg}`);
+                            if (String(retryMsg).includes('Account setup not complete')) {
+                                await waitForAccountSetup(swapApi, session.swapToken, session.partyId, log);
+                            }
+                            // Check if we've exhausted retries
+                            if (rejAttempt >= max422Retries - 1) {
+                                log(`🔄 [422] ${max422Retries}x failed → soft restart`);
+                                const softRestartErr = new Error('422_SOFT_RESTART');
+                                softRestartErr.response = { status: 500 }; // fake 500 to trigger soft restart
+                                throw softRestartErr;
+                            }
+                            continue; // keep retrying
+                        }
+                        throw retryErr;
                     }
                 }
-
-                // ── Escalating retry (only if order still not set) ──
+                // If loop finished without order being set, trigger soft restart
                 if (!order) {
-                    const rejectedDelays = config.retry?.server_rejected_delays || [15, 30, 60];
-                    const max422Retries = config.retry?.max_422_retries ?? 3;
-                    for (let rejAttempt = 0; rejAttempt < max422Retries; rejAttempt++) {
-                        const delay = getEscalatingDelay(rejAttempt, rejectedDelays);
-                        log(` [${errStatus}] wait ${delay}s (#${rejAttempt + 1}/${max422Retries})`);
-                        await sleep(delay);
-                        try {
-                            await session.ensureFreshTokens(walletApi, swapApi, log);
-                            const newQuote = await swapApi.getQuote(fromChain, fromAsset, toChain, toAsset, amount);
-                            Object.assign(quote, newQuote);
-                            const newOrderId = generateOrderId();
-                            order = await swapApi.createOrder(session.swapToken, newOrderId, newQuote.quoteId, session.partyId);
-                            orderId = newOrderId;
-                            log(` Order ${shortId(orderId)} (retry)`);
-                            break;
-                        } catch (retryErr) {
-                            const retryStatus = retryErr.response?.status;
-                            if (retryStatus === 422 || retryStatus === 410 || retryStatus >= 500) {
-                                const retryMsg = retryErr.response?.data?.detail || retryErr.response?.data?.message || retryErr.response?.data || 'Unknown';
-                                log(` [${retryStatus}] ${typeof retryMsg === 'object' ? JSON.stringify(retryMsg) : retryMsg}`);
-                                if (String(retryMsg).includes('Account setup not complete')) {
-                                    await waitForAccountSetup(swapApi, session.swapToken, session.partyId, log);
-                                }
-                                if (rejAttempt >= max422Retries - 1) {
-                                    log(` [${retryStatus}] ${max422Retries}x failed → soft restart`);
-                                    const softRestartErr = new Error('422_SOFT_RESTART');
-                                    softRestartErr.response = { status: 500 };
-                                    throw softRestartErr;
-                                }
-                                continue;
-                            }
-                            throw retryErr;
-                        }
-                    }
-                    // If loop finished without order being set, trigger soft restart
-                    if (!order) {
-                        log(` [${errStatus}] exhausted retries → soft restart`);
-                        const softRestartErr = new Error('422_SOFT_RESTART');
-                        softRestartErr.response = { status: 500 };
-                        throw softRestartErr;
-                    }
+                    log(`🔄 [422] exhausted retries → soft restart`);
+                    const softRestartErr = new Error('422_SOFT_RESTART');
+                    softRestartErr.response = { status: 500 };
+                    throw softRestartErr;
                 }
             } else {
                 throw createErr;
             }
         }
 
-        log(` Order ${shortId(orderId)} created`);
+        log(`✅ Order ${shortId(orderId)} created`);
 
         const instrumentId = ASSET_TO_INSTRUMENT[fromAsset] || fromAsset;
-        log(` Transfer ${order.requiredAmount} ${instrumentId}`);
+        log(`📦 Transfer ${order.requiredAmount} ${instrumentId}`);
         let rawPrepare = null;
         for (let retry = 0; retry < 3; retry++) {
             try {
@@ -2410,11 +2059,11 @@ async function executeSwap(ctx, { fromChain, fromAsset, toChain, toAsset, amount
         const hashB64 = rawPrepare.hash_b64 || rawPrepare.hashB64;
 
         if (!preparedTxB64 || !hashB64) {
-            log(' Missing prepared_tx_b64 or hash_b64');
+            log('❌ Missing prepared_tx_b64 or hash_b64');
             return false;
         }
 
-        log(' Signing & executing transfer...');
+        log('✍️ Signing & executing transfer...');
         const signature = signMessage(session.keyPair.privateKey, Buffer.from(hashB64, 'base64'));
         await session.withRetry(() => walletApi.executeTransaction(session.walletToken, {
             commandId, preparedTxB64,
@@ -2423,25 +2072,25 @@ async function executeSwap(ctx, { fromChain, fromAsset, toChain, toAsset, amount
         }), 'wallet', walletApi, swapApi, log);
 
         // Poll transfer/status until confirmed (HAR flow)
-        log(' Waiting for deposit confirmation...');
+        log('⏳ Waiting for deposit confirmation...');
         for (let ts = 0; ts < 20; ts++) {
             await sleep(3);
             try {
                 const txStatus = await walletApi.getTransferStatus(session.walletToken, commandId);
                 if (txStatus.status === 'success') {
-                    log(' Deposit confirmed on-chain');
+                    log('✅ Deposit confirmed on-chain');
                     break;
                 }
             } catch { /* continue polling */ }
         }
 
-        log(' Polling order status...');
+        log('📊 Polling order status...');
 
         await sleep(3);
         const finalStatus = await pollOrderStatus(ctx, orderId, pollTimeoutMinutes, toAsset);
 
         if (finalStatus === 'COMPLETED' || finalStatus === 'WALLET_CONFIRMED') {
-            log(' Swap completed!');
+            log('🎉 Swap completed!');
             if (finalStatus === 'WALLET_CONFIRMED') {
                 for (let cooldown = 0; cooldown < 6; cooldown++) {
                     await sleep(5);
@@ -2453,36 +2102,19 @@ async function executeSwap(ctx, { fromChain, fromAsset, toChain, toAsset, amount
                 }
             }
             await acceptPendingOffers(ctx);
-
-            // Fetch final order data for TX details
-            let userTxId = '', solverTxId = '', fee = 0;
-            try {
-                const orderData = await swapApi.getOrderStatus(session.swapToken, orderId);
-                userTxId = orderData.userTxId || orderData.user_tx_id || orderData.depositTxId || '';
-                solverTxId = orderData.solverTxId || orderData.solver_tx_id || orderData.withdrawTxId || '';
-                fee = parseFloat(orderData.fee || orderData.networkFee || 0);
-            } catch { /* skip */ }
-
-            return {
-                receiveAmount: quote.receiveAmount,
-                sendAmount: quote.sendAmount,
-                rate: quote.rate,
-                orderId, commandId,
-                slippageBps: 200,
-                userTxId, solverTxId, fee,
-            };
+            return { receiveAmount: quote.receiveAmount };
         } else if (finalStatus === 'TIMEOUT') {
-            log(` Timeout ${pollTimeoutMinutes}m`);
+            log(`⚠️ Timeout ${pollTimeoutMinutes}m`);
             try { await swapApi.cancelOrder(session.swapToken, orderId); } catch { /* ignore */ }
             return false;
         } else {
-            log(` Swap: ${finalStatus}`);
+            log(`❌ Swap: ${finalStatus}`);
             return false;
         }
 
     } catch (err) {
         const errMsg = formatError(err);
-        log(` ${errMsg}`);
+        log(`❌ ${errMsg}`);
         // Return error info for caller to handle
         return { error: true, code: err.response?.status || err.code, message: err.response?.data?.detail || err.response?.data?.message || err.message };
     }
@@ -2496,7 +2128,7 @@ async function pollOrderStatus(ctx, orderId, maxMinutes = 0, toAsset = null) {
     let lastStatus = '';
     let pollCount = 0;
     let stuckSince = 0;
-    const ICONS = { COMPLETED: '', FAILED: '', CANCELLED: '', FUNDED: '', EXECUTING: '', PROCESSING: '', WITHDRAWING: '', AWAITING_DEPOSIT: '' };
+    const ICONS = { COMPLETED: '✅', FAILED: '❌', CANCELLED: '🚫', FUNDED: '💰', EXECUTING: '⚙️', PROCESSING: '🔄', WITHDRAWING: '📤', AWAITING_DEPOSIT: '⏳' };
     const maxPolls = maxMinutes > 0 ? Math.ceil(maxMinutes * 60 / 5) : Infinity;
 
     let preSwapBalance = null;
@@ -2505,7 +2137,7 @@ async function pollOrderStatus(ctx, orderId, maxMinutes = 0, toAsset = null) {
             const { holdings = {} } = await session.withRetry(
                 () => walletApi.getBalance(session.walletToken), 'wallet', walletApi, swapApi, log
             );
-            const assetNames = toAsset === '0x0' ? ['Amulet', 'CC (Amulet)', 'CC'] : toAsset === 'CETH' ? ['cETH', 'CETH'] : ['USDCx', 'USDCX'];
+            const assetNames = toAsset === '0x0' ? ['Amulet', 'CC (Amulet)', 'CC'] : ['USDCx', 'USDCX'];
             for (const n of assetNames) {
                 if (holdings[n]?.balance != null) { preSwapBalance = holdings[n].balance; break; }
             }
@@ -2527,7 +2159,7 @@ async function pollOrderStatus(ctx, orderId, maxMinutes = 0, toAsset = null) {
             const { holdings = {} } = await session.withRetry(
                 () => walletApi.getBalance(session.walletToken), 'wallet', walletApi, swapApi, log
             );
-            const assetNames = toAsset === '0x0' ? ['Amulet', 'CC (Amulet)', 'CC'] : toAsset === 'CETH' ? ['cETH', 'CETH'] : ['USDCx', 'USDCX'];
+            const assetNames = toAsset === '0x0' ? ['Amulet', 'CC (Amulet)', 'CC'] : ['USDCx', 'USDCX'];
             let currentBalance = 0;
             for (const n of assetNames) {
                 if (holdings[n]?.balance != null) { currentBalance = holdings[n].balance; break; }
@@ -2566,7 +2198,7 @@ async function pollOrderStatus(ctx, orderId, maxMinutes = 0, toAsset = null) {
             consecutiveNetErrors = 0; // reset on success
 
             if (status !== lastStatus) {
-                const icon = ICONS[status] || '';
+                const icon = ICONS[status] || '⏳';
                 log(`${icon} Status: ${status} (${pollCount * 5}s)`);
                 lastStatus = status;
                 stuckSince = pollCount;
@@ -2590,18 +2222,18 @@ async function pollOrderStatus(ctx, orderId, maxMinutes = 0, toAsset = null) {
             // Network error that survived retryOnNetwork retries
             consecutiveNetErrors++;
             const errDetail = formatError(err);
-            log(` Poll error (${consecutiveNetErrors}/${MAX_CONSECUTIVE_NET_ERRORS}): ${errDetail}`);
+            log(`⚠️ Poll error (${consecutiveNetErrors}/${MAX_CONSECUTIVE_NET_ERRORS}): ${errDetail}`);
 
             // Check wallet early if we're getting repeated errors
             if (consecutiveNetErrors >= 3 && consecutiveNetErrors % 2 === 1) {
                 if (await walletSideCheck()) {
-                    log(` Wallet confirmed despite poll errors`);
+                    log(`✅ Wallet confirmed despite poll errors`);
                     return 'WALLET_CONFIRMED';
                 }
             }
 
             if (consecutiveNetErrors >= MAX_CONSECUTIVE_NET_ERRORS) {
-                log(` Too many poll errors, final wallet check...`);
+                log(`❌ Too many poll errors, final wallet check...`);
                 if (await walletSideCheck()) return 'WALLET_CONFIRMED';
                 throw err; // propagate to trigger runAccount restart
             }
@@ -2620,7 +2252,7 @@ async function fetchAndLogProxyIps(accounts) {
     const proxied = accounts.filter(a => a.proxy);
     if (!proxied.length) return;
 
-    console.log(chalk.gray('   Fetching proxy IPs...'));
+    console.log(chalk.gray('  🌐 Fetching proxy IPs...'));
     const IP_ENDPOINTS = [
         { url: 'https://api.ipify.org?format=json', extract: r => r.data?.ip },
         { url: 'https://api4.my-ip.io/ip.json', extract: r => r.data?.ip },
@@ -2660,90 +2292,97 @@ async function fetchAndLogProxyIps(accounts) {
     const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
     const header = `# Run: ${timestamp}\n`;
     writeFileSync(new URL('./proxy_ips.txt', import.meta.url), header + lines.join('\n') + '\n', 'utf-8');
-    console.log(chalk.gray(`   Proxy IPs saved to proxy_ips.txt\n`));
+    console.log(chalk.gray(`  ✅ Proxy IPs saved to proxy_ips.txt\n`));
 }
 
+// ── Telegram Notification (summary TOT setiap N menit) ───────────────────
 
-// ── Menu Selection ───────────────────────────────────────────────────────
+async function sendTelegramSummary() {
+    const tg = config.telegram;
+    if (!tg?.enabled || !tg.bot_token || !tg.chat_id) return;
 
-async function showMenu() {
-    const defaultMode = config.swap?.swap_mode ?? 4;
-    const schedule = config.swap?.swaps_per_window_schedule || [2, 3];
-    const cdMin = Math.round((config.swap?.cooldown_seconds ?? 1320) / 60);
-    const rlSec = config.swap?.rate_limit_wait_seconds ?? 1860;
-    const txPerCycle = config.swap?.tx_per_cycle ?? 2;
-    const totalTx = schedule.reduce((a, b) => a + b, 0);
-    const ppCooldownMin = Math.round(rlSec / txPerCycle / 60); // per-TX cooldown for Mode 1/2
+    // Hitung total dari semua akun (sama dengan baris TOT di dashboard)
+    let totCC = 0, totUSDCx = 0, totCETH = 0, totReward = 0, totDelta = 0, totSwaps = 0;
+    let activeCount = 0;
+    for (const a of dashboard.accounts) {
+        totCC += a.cc || 0;
+        totUSDCx += a.usdcx || 0;
+        totCETH += a.ceth || 0;
+        totReward += a.monthReward || 0;
+        totDelta += a.diffReward || 0;
+        totSwaps += a.totalSwaps || 0;
+        if (a.status && a.status !== 'init' && a.status !== 'done') activeCount++;
+    }
 
-    return new Promise((resolve) => {
-        const rl = createInterface({ input: process.stdin, output: process.stdout });
-
-        const c = chalk.hex('#555');
-        const W = 54;
-        console.log('');
-        console.log(c(`  \u250c${'─'.repeat(W)}\u2510`));
-        console.log(c(`  \u2502`) + centerToWidth(chalk.bold.hex('#67E8F9')('Cantor8 Bot V2 -- Pilih Mode Swap'), W) + c('\u2502'));
-        console.log(c(`  \u251c${'─'.repeat(W)}\u2524`));
-        console.log(c(`  \u2502`) + fitToWidth(` ${chalk.hex('#6EE7B7')('1.')} CC <> USDCx   (${txPerCycle}TX/window, cd ${ppCooldownMin}m/TX)`, W) + c('\u2502'));
-        console.log(c(`  \u2502`) + fitToWidth(` ${chalk.hex('#6EE7B7')('2.')} CC <> CETH    (${txPerCycle}TX/window, cd ${ppCooldownMin}m/TX)`, W) + c('\u2502'));
-        console.log(c(`  \u2502`) + fitToWidth(` ${chalk.hex('#6EE7B7')('3.')} Triangular   (CC>USDCx>CETH>CC) 3TX`, W) + c('\u2502'));
-        console.log(c(`  \u2502`) + fitToWidth(` ${chalk.hex('#6EE7B7')('4.')} Extended     (${totalTx}TX/cycle, batch ${schedule.join('+')}, cd ${cdMin}m)`, W) + c('\u2502'));
-        console.log(c(`  \u251c${'─'.repeat(W)}\u2524`));
-        console.log(c(`  \u2502`) + fitToWidth(chalk.gray(` Default: [${defaultMode}] -- tekan Enter = pakai default`), W) + c('\u2502'));
-        console.log(c(`  \u2514${'─'.repeat(W)}\u2518`));
-        console.log('');
-
-        rl.question(chalk.yellow('  Pilih mode (1-4): '), (answer) => {
-            rl.close();
-            const mode = parseInt(answer) || defaultMode;
-            if (mode >= 1 && mode <= 4) {
-                resolve(mode);
-            } else {
-                console.log(chalk.red('   Invalid, using default: ' + defaultMode));
-                resolve(defaultMode);
-            }
-        });
+    const totDeltaStr = totDelta >= 0 ? `+${totDelta.toFixed(2)}` : totDelta.toFixed(2);
+    const now = new Date().toLocaleString('id-ID', {
+        timeZone: 'Asia/Jakarta', hour12: false,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit',
     });
+
+    const msg =
+        `📊 *Cantor8 Bot Summary*\n` +
+        `🕒 ${now} WIB\n\n` +
+        `👥 Akun: ${dashboard.accounts.length} (aktif: ${activeCount})\n` +
+        `💰 CC: ${totCC.toFixed(2)}\n` +
+        `💵 USDCx: ${totUSDCx.toFixed(4)}\n` +
+        `🪙 cETH: ${totCETH.toFixed(6)}\n` +
+        `🔁 Total Swap: ${totSwaps}\n` +
+        `🏆 Reward Bulan Ini: ${totReward.toFixed(2)} CC\n` +
+        `📈 Δ Reward: ${totDeltaStr} CC`;
+
+    try {
+        const url = `https://api.telegram.org/bot${tg.bot_token}/sendMessage`;
+        await axios.post(url, {
+            chat_id: tg.chat_id,
+            text: msg,
+            parse_mode: 'Markdown',
+        }, { timeout: 15000 });
+    } catch (err) {
+        // Log error ke dashboard akun pertama (kalau ada)
+        if (dashboard.accounts.length > 0) {
+            const errMsg = err.response?.data?.description || err.message;
+            dashboard.log(0, `⚠️ Telegram notif gagal: ${String(errMsg).slice(0, 60)}`);
+        }
+    }
 }
+
+function startTelegramScheduler() {
+    const tg = config.telegram;
+    if (!tg?.enabled) return null;
+    if (!tg.bot_token || !tg.chat_id) {
+        console.log(chalk.yellow('⚠️ Telegram aktif tapi bot_token/chat_id kosong, skip'));
+        return null;
+    }
+    const intervalMs = Math.max(1, tg.interval_minutes) * 60 * 1000;
+    console.log(chalk.cyan(`  📱 Telegram notif aktif (tiap ${tg.interval_minutes}m)`));
+
+    // Kirim summary pertama setelah delay singkat (biar dashboard sudah ada data)
+    const initialDelayMs = 30 * 1000;
+    setTimeout(() => sendTelegramSummary(), initialDelayMs);
+
+    return setInterval(() => sendTelegramSummary(), intervalMs);
+}
+
 // ── Main Entry Point ─────────────────────────────────────────────────────
 
 async function main() {
     const accounts = config.accounts || [];
 
     if (!accounts.length) {
-        console.error(chalk.red(' No accounts configured in config.json'));
+        console.error(chalk.red('❌ No accounts configured in config.json'));
         process.exit(1);
     }
 
     process.stdout.write('\x1B[H\x1B[2J');
-    console.log(chalk.cyan.bold(`   CANTOR8 MULTI-ACCOUNT BOT V2 — ${accounts.length} account(s)\n`));
+    console.log(chalk.cyan.bold(`  🤖 CANTOR8 MULTI-ACCOUNT BOT V2 — ${accounts.length} account(s)\n`));
 
-    // ── Mode Selection ──
-    swapMode = await showMenu();
-    activePairMode = 'USDCX';
-
-    const _txPerCycle = config.swap.tx_per_cycle ?? 2;
-    const _rlSec = config.swap.rate_limit_wait_seconds ?? 1860;
-    const _ppCdMin = Math.round(_rlSec / _txPerCycle / 60);
-    const _schedule = config.swap.swaps_per_window_schedule || [2, 3];
-    const _cdMin = Math.round((config.swap.cooldown_seconds ?? 1320) / 60);
-    const _rlMin = Math.round(_rlSec / 60);
-    const modeNames = {
-        1: `CC  USDCx Ping-Pong (${_txPerCycle}TX/window, ${_ppCdMin}m/TX)`,
-        2: `CC  CETH  Ping-Pong (${_txPerCycle}TX/window, ${_ppCdMin}m/TX)`,
-        3: 'Triangular (CC→USDCx→CETH→CC) 3TX',
-        4: 'Extended (' + String(_schedule.reduce((a, b) => a + b, 0)) + 'TX/cycle, batch ' + _schedule.join('+') + ', cd ' + _cdMin + 'm)',
-    };
-    console.log(chalk.green.bold('\n   Mode ' + swapMode + ': ' + modeNames[swapMode]));
-    if (swapMode === 1 || swapMode === 2) {
-        console.log(chalk.gray(`   Cooldown: ${_ppCdMin}m per TX | window=${_rlMin}m | tx_per_cycle=${_txPerCycle}\n`));
-    } else {
-        console.log(chalk.gray('   Cooldown: batch=' + _cdMin + 'm | siklus=' + _rlMin + 'm\n'));
-    }
     await fetchAndLogProxyIps(accounts);
 
     dashboard.init(accounts);
     dashboard.startAutoRefresh();
+    const telegramTimer = startTelegramScheduler();
 
     // Stagger account starts with random delay to prevent ECONNRESET stampede and detection
     const STAGGER_MIN_SEC = config.stagger_min_seconds ?? 5;
@@ -2757,7 +2396,7 @@ async function main() {
     });
 
     // Log stagger plan
-    console.log(chalk.gray(`   Stagger plan:`));
+    console.log(chalk.gray(`  📋 Stagger plan:`));
     let cumulativeDelay = 0;
     staggerDelays.forEach((delay, i) => {
         cumulativeDelay += delay;
@@ -2783,21 +2422,13 @@ async function main() {
     );
 
     dashboard.stop();
+    if (telegramTimer) clearInterval(telegramTimer);
+    // Kirim summary final sebelum exit
+    await sendTelegramSummary();
 
     const ok = results.filter(r => r.status === 'fulfilled').length;
     const fail = results.filter(r => r.status === 'rejected').length;
-    console.log(chalk.bold.green(`\n   All done: ${ok} ok, ${fail} fail\n`));
+    console.log(chalk.bold.green(`\n  ✅ All done: ${ok} ok, ${fail} fail\n`));
 }
-
-// ── Graceful Shutdown (Ctrl+C) ───────────────────────────────────────────
-process.on('SIGINT', () => {
-    console.log(chalk.yellow('\n\n    Ctrl+C detected, shutting down...\n'));
-    dashboard.stop();
-    process.exit(0);
-});
-process.on('SIGTERM', () => {
-    dashboard.stop();
-    process.exit(0);
-});
 
 main();

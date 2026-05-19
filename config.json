@@ -1,79 +1,24 @@
 {
-    "swap": {
-        "enabled": true,
-        "rounds": 100000,
-        "delay_min_seconds": 1740,
-        "delay_max_seconds": 1800,
-        "min_amount": 27,
-        "cc_reserve": 0.1,
-        "waiting_balance_threshold": 27,
-        "dynamic_minimum_swap": {
-            "enabled": true,
-            "extra_cc": 1.5,
-            "fallback_min": 27
-        },
-        "swap_mode": 4,
-        "tx_per_cycle": 3,
-        "swaps_per_window_schedule": [
-            3
-        ],
-        "cooldown_seconds": 0,
-        "pair_a": {
-            "chain": "CC",
-            "asset": "0x0",
-            "label": "CC (Amulet)"
-        },
-        "pair_b": {
-            "chain": "CC",
-            "asset": "USDCX",
-            "label": "USDCX"
-        },
-        "pair_ceth": {
-            "chain": "CC",
-            "asset": "CETH",
-            "label": "CETH"
-        },
-        "ceth_bulk_min": 0.0005,
-        "reward_estimate_ceth": 0.38,
-        "reward_estimate_usdcx": 0.29,
-        "max_acceptable_loss_cc": 0.28,
-        "rate_check_interval_seconds": 20,
-        "rate_limit_wait_seconds": 3600
+    "app_base": "https://app.templedigitalgroup.com",
+    "cantonloop_base": "https://cantonloop.com",
+    "symbol": "Amulet/USDCx",
+    "strategy": "auto",
+    "auto_deposit": true,
+    "max_cc_deposit": 200,
+    "auto": {
+        "auto_quantity": 105,
+        "auto_poll_interval": 4,
+        "auto_max_open": 500,
+        "auto_use_oracle": true,
+        "strategy_key": "G",
+        "order_max_age": 3600,
+        "min_cc_reserve": 0
     },
-    "background_refresh": {
-        "enabled": true,
-        "interval_seconds": 3540
+    "loop": {
+        "loop_cc_reserve": 25.0,
+        "loop_usdc_reserve": 0.1,
+        "loop_poll_interval": 10,
+        "max_settling_for_deposit": 0
     },
-    "retry": {
-        "rate_limit_initial_delay_minutes": 28,
-        "rate_limit_delays": [
-            15,
-            30,
-            60
-        ],
-        "server_rejected_delays": [
-            15,
-            30,
-            60
-        ],
-        "max_422_retries": 3
-    },
-    "api": {
-        "backend_url": "https://wallet-backend.main.digik.cantor8.tech/api",
-        "swap_url": "https://api.vectornine.tech",
-        "exchange_url": "https://exchange.cantor8.tech"
-    },
-    "stagger_min_seconds": 5,
-    "stagger_max_seconds": 20,
-    "max_log_lines": 35,
-    "derivation": {
-        "path_prefix": "m/501'/800245900'/0'",
-        "path_suffix": "0'",
-        "key_count": 20
-    },
-    "telegram": {
-        "enabled": true,
-        "bot_token": "",
-        "user_id": ""
-    }
+    "cantonloop_party_id": "LOOP PARTY ID"
 }
