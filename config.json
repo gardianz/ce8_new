@@ -1,49 +1,63 @@
 {
     "_petunjuk": "Pengaturan bot — edit nilai sesuai kebutuhan, jangan ubah nama field.",
-
-    "jumlah_swap": 10000,
+    "jumlah_swap": 1000,
     "_jumlah_swap": "Berapa kali putaran swap (1 putaran = CC -> USDCx -> CETH -> CC).",
-
     "jeda_antar_swap_detik": {
         "minimal": 10,
         "maksimal": 11,
         "_keterangan": "Jeda acak antar putaran swap (detik). Bot akan tidur antara 'minimal'-'maksimal' detik."
     },
-
     "jeda_start_antar_akun_detik": {
-        "minimal": 5,
-        "maksimal": 10,
+        "minimal": 1,
+        "maksimal": 2,
         "_keterangan": "Jeda acak saat memulai tiap akun supaya tidak start berbarengan."
     },
-
     "swap_minimum_cc": {
-        "tambahan_cc": 1.5,
+        "tambahan_cc": 2,
         "fallback_jika_api_gagal": 27,
         "_keterangan": "Bot mengambil minimum swap dari API lalu menambah 'tambahan_cc'. Jika API gagal, pakai 'fallback_jika_api_gagal'."
     },
-
-    "menunggu_saldo_cc_dibawah": 27,
+    "menunggu_saldo_cc_dibawah": 25,
     "_menunggu_saldo_cc_dibawah": "Kalau setelah bulk-back CC <= angka ini, bot akan menunggu saldo masuk.",
-
     "berhenti_jika_reward_cc_tercapai": 10000,
     "_berhenti_jika_reward_cc_tercapai": "Hentikan swap kalau saldo CC sudah >= angka ini (anggap reward sudah turun).",
-
     "rate_limit": {
-        "tunggu_pertama_menit": 15,
-        "tunggu_lanjutan_detik": [15, 30, 60],
+        "tunggu_pertama_menit": 10,
+        "tunggu_lanjutan_detik": [
+            500,
+            400,
+            300
+        ],
         "_keterangan": "Saat kena rate limit (429): hit pertama tunggu N menit, hit berikutnya tunggu sesuai 'tunggu_lanjutan_detik' (detik)."
     },
-
     "tampilan": {
         "max_log_baris": 35,
         "_keterangan": "Jumlah baris log yang ditampilkan di panel kanan."
     },
-
     "telegram": {
         "aktif": true,
         "bot_token": "",
         "chat_id": "",
         "interval_menit": 60,
         "_keterangan": "Notifikasi summary (TOT) ke Telegram. Set 'aktif': false untuk mematikan. 'interval_menit' = jeda antar notifikasi dalam menit."
+    },
+    "dashboard": {
+        "aktif": false,
+        "url": "",
+        "api_key": "",
+        "vps_id": "",
+        "push_interval_detik": 30,
+        "_keterangan": "Bot push data ke web dashboard. Setiap VPS harus punya 'vps_id' unik (misal vps-1, vps-2). Kalau dibiarkan 'default' atau dikosongkan, bot akan pakai env VPS_ID, atau auto-derive dari hostname OS. Ganti 'url' setelah deploy Fly.io."
+    },
+    "consolidation": {
+        "enabled": true,
+        "transfer_fee_reserve": 0.5,
+        "min_donor_balance": 1.0,
+        "convert_before_drain": true,
+        "per_transfer_timeout_sec": 30,
+        "inter_transfer_delay_sec": 2,
+        "abort_on_failure_rate": 0.30,
+        "command_poll_interval_sec": 10,
+        "_keterangan": "Pool consolidation antar akun (pair-based). Dipicu manual dari dashboard tab Tools. 'transfer_fee_reserve' = saldo CC yang disisakan di akun donor untuk fee. 'min_donor_balance' = saldo minimum donor untuk dianggap worth-transfer. 'convert_before_drain' = USDCx/cETH di-swap ke CC dulu. 'command_poll_interval_sec' = berapa detik bot polling command queue dari dashboard."
     }
 }

@@ -1166,7 +1166,7 @@ const dashboard = {
         const rewardUsd = totReward * ccUsdNow;
         const rewardIdrStr = fmtIdrCompact(rewardUsd);
         left.push(centerToWidth(
-            `${chalk.hex('#FFD700')('CC')} ${chalk.white.bold(ccPriceStr)}  ` +
+            `${chalk.hex('#FFD700')('CC')} ${mobile ? chalk.white(ccPriceStr) : chalk.white.bold(ccPriceStr)}  ` +
             `${chalk.hex('#67E8F9')('Up')} ${chalk.white(upStr)}  ` +
             `${chalk.hex('#A7F3D0')('Modal')} ${chalk.white.bold(modalIdrStr)}  ` +
             `${chalk.hex('#F472B6')('Reward')} ${chalk.white.bold(rewardIdrStr)}`,
@@ -2564,6 +2564,7 @@ async function performSwap(ctx, holdings) {
     // ───────────────────────────────────────────────────────────────────
 
     // ── ROUND-TRIP 2-asset branch (pola b/c/d) ──────────────────────────
+    // ── ROUND-TRIP 2-asset branch (pola b/c/d) ──────────────────────────
     if (SWAP_PATTERN === 'CCU' || SWAP_PATTERN === 'UCE' || SWAP_PATTERN === 'CCE') {
         // Map pola → base / other / stray (asset luar-rute)
         // CCU: CC↔USDCx (stray cETH) | UCE: USDCx↔cETH (stray CC) | CCE: CC↔cETH (stray USDCx)
@@ -2605,12 +2606,26 @@ async function performSwap(ctx, holdings) {
     }
     // ───────────────────────────────────────────────────────────────────
 
-    log(`⚡ ${rounds} rounds (alur CC→USDCx→CETH→CC, no bulk-back)`);
+    const patternLabel2 = SWAP_PATTERN === 'A'
+        ? 'CC→USDCx→CETH→CC'
+        : 'CC→USDCx→CETH→USDCx→CC';
+    log(`⚡ ${rounds} rounds (alur ${patternLabel2}, no bulk-back)`);
+
+    // Pattern B state: per round, tandai apakah CETH sudah dikonversi ke USDCx kali ini.
+    // Kalau true → USDCx yang sekarang ada adalah "USDCx hasil dari CETH" → harus → CC.
+    // Kalau false → USDCx adalah "USDCx hasil dari CC" → harus → CETH.
+    let cethConsumedThisRound = false;
 
     for (let round = 1; round <= rounds; round++) {
         await session.ensureFreshTokens(walletApi, swapApi, log);
         try { await acceptPendingOffers(ctx); } catch { /* ignore */ }
         await refreshBalances();
+
+        // Pattern B: kalau saldo USDCx & CETH habis di awal round (state bersih dari CC),
+        // pastikan flag direset supaya leg-2 nanti adalah USDCx→CETH bukan USDCx→CC.
+        if (SWAP_PATTERN === 'B' && cethBalance <= 0 && usdcxBalance < 0.0001) {
+            cethConsumedThisRound = false;
+        }
 
         if (ccBalance >= rewardThreshold) {
             log(`🎉 Reward landed mid-loop! CC(${ccBalance.toFixed(2)})`);
@@ -2618,19 +2633,30 @@ async function performSwap(ctx, holdings) {
             return;
         }
 
-        // ── STEP A: Selesaikan saldo CETH → CC langsung ──
+        // ── STEP A: Selesaikan saldo CETH ──
+        // Pattern A: CETH → CC langsung
+        // Pattern B: CETH → USDCx (lalu STEP B akan handle USDCx → CC karena cethConsumedThisRound=true)
         if (pair_c && cethBalance > 0) {
-            dashboard.update(index, { status: `${pair_c.label}→CC R${round}` });
-            const r = await doLeg(pair_c, pair_a, cethBalance, `R${round} ${pair_c.label}→CC`, { pollTimeoutMinutes: 10 });
+            const isB = SWAP_PATTERN === 'B';
+            const targetPair = isB ? pair_b : pair_a;
+            const dirLabel = isB ? `${pair_c.label}→U` : `${pair_c.label}→CC`;
+            dashboard.update(index, { status: `${dirLabel} R${round}` });
+            const r = await doLeg(pair_c, targetPair, cethBalance, `R${round} ${dirLabel}`, { pollTimeoutMinutes: 10 });
             if (r) {
                 totalSwaps++;
                 dashboard.update(index, {
-                    totalSwaps, lastSwapDir: '↩CC',
+                    totalSwaps, lastSwapDir: isB ? `↩U` : '↩CC',
                     swapsCETHtoCC: (dashboard.accounts[index].swapsCETHtoCC || 0) + 1,
-                    swapsUtCC: (dashboard.accounts[index].swapsUtCC || 0) + 1,
+                    ...(isB
+                        ? {} // pattern B: CETH→USDCx, belum sampai CC
+                        : { swapsUtCC: (dashboard.accounts[index].swapsUtCC || 0) + 1 }),
                 });
                 consecutiveFails = 0;
                 await refreshBalances();
+                if (isB) {
+                    cethConsumedThisRound = true; // tandai sebelum lanjut STEP B
+                    round--; continue;
+                }
             } else {
                 consecutiveFails++;
                 await sleep(Math.min(15 * consecutiveFails, 120));
@@ -2638,21 +2664,37 @@ async function performSwap(ctx, holdings) {
             }
         }
 
-        // ── STEP B: Selesaikan saldo USDCx → CETH ──
+        // ── STEP B: Selesaikan saldo USDCx ──
+        // Pattern A: USDCx → CETH (lalu STEP A akan swap CETH → CC)
+        // Pattern B:
+        //   - cethConsumedThisRound=false → USDCx → CETH (sama dengan A, ini leg ke-2 dari 4)
+        //   - cethConsumedThisRound=true  → USDCx → CC (leg ke-4, final)
         if (pair_c && usdcxBalance >= 0.0001) {
-            dashboard.update(index, { status: `U→${pair_c.label} R${round}` });
-            const r = await doLeg(pair_b, pair_c, usdcxBalance, `R${round} U→${pair_c.label}`, { pollTimeoutMinutes: 10 });
+            const isB = SWAP_PATTERN === 'B';
+            // Pattern B + sudah lewat CETH = final leg USDCx→CC; selainnya tetap USDCx→CETH
+            const goDirectToCC = isB && cethConsumedThisRound;
+            const targetPair = goDirectToCC ? pair_a : pair_c;
+            const dirLabel = goDirectToCC ? `U→CC` : `U→${pair_c.label}`;
+            dashboard.update(index, { status: `${dirLabel} R${round}` });
+            const r = await doLeg(pair_b, targetPair, usdcxBalance, `R${round} ${dirLabel}`, { pollTimeoutMinutes: 10 });
             if (r) {
                 totalSwaps++;
                 dashboard.update(index, {
                     totalSwaps,
-                    lastSwapDir: `→${pair_c.label}`,
-                    swapsUtoCETH: (dashboard.accounts[index].swapsUtoCETH || 0) + 1,
+                    lastSwapDir: goDirectToCC ? '↩CC' : `→${pair_c.label}`,
+                    ...(goDirectToCC
+                        ? { swapsUtCC: (dashboard.accounts[index].swapsUtCC || 0) + 1 }
+                        : { swapsUtoCETH: (dashboard.accounts[index].swapsUtoCETH || 0) + 1 }),
                 });
                 consecutiveFails = 0;
                 await refreshBalances();
-                // USDCx→CETH selesai → lanjut STEP A di iterasi berikutnya
-                round--; continue;
+                if (goDirectToCC) {
+                    // Pattern B leg-4 selesai → reset flag, fall through ke delay
+                    cethConsumedThisRound = false;
+                } else {
+                    // USDCx→CETH selesai → lanjut STEP A di iterasi berikutnya
+                    round--; continue;
+                }
             } else {
                 consecutiveFails++;
                 await sleep(Math.min(15 * consecutiveFails, 120));
@@ -2762,7 +2804,18 @@ async function performSwap(ctx, holdings) {
         }
     }
     if (pair_c && usdcxBalance >= 0.0001) {
-        {
+        if (SWAP_PATTERN === 'B') {
+            // Pattern B cleanup: USDCx → CC langsung (jalur final yang konsisten dengan pola)
+            const r = await doLeg(pair_b, pair_a, usdcxBalance, `Final U→CC`, { pollTimeoutMinutes: 10 });
+            if (r) {
+                totalSwaps++;
+                dashboard.update(index, {
+                    totalSwaps,
+                    swapsUtCC: (dashboard.accounts[index].swapsUtCC || 0) + 1,
+                });
+                await refreshBalances();
+            }
+        } else {
             // Pattern A cleanup: USDCx → CETH → CC
             const r2 = await doLeg(pair_b, pair_c, usdcxBalance, `Final U→${pair_c.label}`, { pollTimeoutMinutes: 10 });
             if (r2) {
